@@ -23,5 +23,7 @@
 | HOME shortcuts / mode switching / remote HOME on hardware | Pending physical retest |
 | 60 fps sustained | Not measured |
 
-Last updated: input-usability and gaming-support milestone (HOME shortcuts,
-live mode switching, backlight controls).
+Last updated: settings layout + direct connections milestone (unicast 'B'
+to host:port, DNS resolution, custom listen port, observed source-port
+replies). Pending: saved connection profiles UI + alphanumeric keyboard,
+physical retest of HOME shortcuts.
