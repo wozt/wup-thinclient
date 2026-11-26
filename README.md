@@ -69,10 +69,19 @@ for an explicit **Connect**.
   authentication.
 - **Auto-connect** (menu toggle, off by default): connect automatically on
   launch and retry automatically after an unexpected drop.
-- **In-stream HOME menu**: Resume / Disconnect / Reconnect / Controls /
-  Exit. While it is open the stream pauses (decoder stopped, next
-  keyframe resumes it) and **all remote input is released** — nothing you
-  press reaches the desktop until you resume.
+- **In-stream menu**: hold **HOME for 5 s** → Resume / Disconnect /
+  Reconnect / Controls / Exit. While it is open the stream pauses
+  (decoder stopped, next keyframe resumes it) and **all remote input is
+  released** — nothing you press reaches the desktop until you resume.
+- **HOME shortcuts** (local, resolved by a non-blocking state machine):
+  - short **HOME** tap → forwarded to ThinServer as a normal button press
+    (bindable in Settings; default opens the XFCE app menu);
+  - **HOME + X** → live Desktop/Gamepad mode switch on the server
+    (`'T'` request + ack; the effective mode is shown in the menu);
+  - **HOME + D-pad Up/Down** → physical screen backlight brighter/dimmer;
+  - **HOME + B** held 2 s → emergency exit.
+  Combo partners are masked from the remote report, so e.g. HOME+X never
+  also toggles Onboard.
 - **Disconnect / loss**: manual disconnect returns to the menu and stops
   reconnecting; an unexpected drop retries only when auto-connect is on,
   otherwise shows "Connection lost" in the menu. The Linux desktop stays

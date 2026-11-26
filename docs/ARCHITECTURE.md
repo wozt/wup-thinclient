@@ -41,8 +41,15 @@ Added for ThinClient:
   authentication.
 - Local UI: connection menu (Connect / Edit / Use any server / Auto-connect /
   Exit, touch + d-pad), touchscreen numeric IPv4 keypad, and an in-stream
-  HOME menu that pauses the decoder and sends a neutral input report (all
-  remote inputs released) until Resume.
+  menu reached by a 5 s HOME hold that pauses the decoder and sends a
+  neutral input report (all remote inputs released) until Resume.
+- HOME shortcuts (`pad/home_keys.c`, pure logic + host unit tests): short
+  tap → remote HOME pulse; 5 s hold → local menu; HOME+X → `'T'` live
+  mode request; HOME+Up/Down → `wup_backlight` steps; HOME+B → quit.
+  Partners are masked from the remote report while HOME is held.
+- Live input mode: `'T' reqid mode 0` requests + `'T' reqid status mode`
+  acks, `'H'` byte 4 advertises the effective mode; unsupported servers
+  time out after 2.5 s and the UI says so.
 - Branding: "WUP ThinClient", own `app.cfg` (name/author/url/icon).
 
 ## Memory budget

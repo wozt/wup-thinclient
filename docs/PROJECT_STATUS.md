@@ -8,16 +8,20 @@
 | Touchscreen IPv4 keypad (validation, Save/Cancel, pressed feedback) | Implemented — pending hardware validation |
 | Explicit any-server menu action + persistence | Implemented — pending hardware validation |
 | Auto-connect option (off by default) + auto-reconnect on loss | Implemented — pending hardware retest |
-| In-stream HOME menu (Resume/Disconnect/Reconnect/Controls/Exit) | Implemented — pending hardware retest |
+| In-stream menu via 5 s HOME hold (Resume/Disconnect/Reconnect/Controls/Exit) | Implemented — pending hardware retest |
 | Remote-input release while local menu open (neutral report) | Implemented — pending hardware retest |
-| HOME never forwarded to the remote desktop | Implemented |
+| HOME shortcut state machine (short tap forwarded, 5 s menu, HOME+X mode switch, HOME+Up/Down backlight, HOME+B exit, no leakage) | Implemented + host unit tests — pending hardware retest |
+| Remote HOME forwarding + server-side bindable HOME | Implemented — pending hardware retest |
+| Live Desktop/Gamepad mode switching (`'T'` request/ack + `'H'` mode byte) | Implemented + host unit tests — pending hardware retest |
+| Local hardware backlight shortcuts (HOME+Up/Down) | Implemented — pending hardware retest |
 | Root Makefile build (`make setup/build/test/deploy`) | Tested automatically |
 | Pinned libwup SDK via git submodule + `LIBWUP_DIR` override | Tested automatically |
-| `.wup` artifact at `build/apps/wup_thinclient.wup` (~126 KB) | Tested automatically |
+| `.wup` artifact at `build/apps/wup_thinclient.wup` | Tested automatically |
 | NetFS deploy to `~/wup-share` with SHA256 verify | Tested automatically |
-| Host-side unit tests (config format, app.cfg) | Tested automatically |
-| **Core streaming on physical GamePad (WUP-010)** | **Validated — developer-reported** (desktop visible & usable) |
-| Connection menu / HOME menu / auto-show keyboard on hardware | Pending physical retest |
+| Host-side unit tests (config format, app.cfg, IPv4 editor, HOME shortcut state machine) | Tested automatically |
+| **Core streaming on physical GamePad (WUP-010)** | **Validated — developer-reported** (all 13 baseline checks passed) |
+| HOME shortcuts / mode switching / remote HOME on hardware | Pending physical retest |
 | 60 fps sustained | Not measured |
 
-Last updated: input-usability milestone (touchscreen IPv4 keypad).
+Last updated: input-usability and gaming-support milestone (HOME shortcuts,
+live mode switching, backlight controls).

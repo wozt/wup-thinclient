@@ -13,7 +13,10 @@ configuration (desktop, quality, input map) lives in WUP ThinServer's
 | Auto-connect | Menu → **Auto-connect** toggle | **off** |
 | Persisted file | `/save/thinclient.cfg` on GamePad flash | — |
 | Emergency quit | **HOME + B** ~2 s (any state) | — |
-| In-stream menu | **HOME** while streaming | Resume/Disconnect/Reconnect/Controls/Exit |
+| Local shortcuts | **HOME** held 5 s | in-stream menu (Resume/Disconnect/Reconnect/Controls/Exit) |
+| Local shortcuts | **HOME + X** | live Desktop/Gamepad mode switch (`'T'` packet, acked) |
+| Local shortcuts | **HOME + D-pad Up/Down** | physical backlight brighter/dimmer (hardware levels) |
+| Remote HOME | **HOME** short tap | forwarded to ThinServer — bindable like any button |
 
 `thinclient.cfg` format (one line, whitespace-separated tokens):
 `<ip-or-any> auto=<0|1>`, e.g. `192.168.1.10 auto=0` or `any auto=1`.
@@ -34,13 +37,20 @@ defaults to off.
 - An unexpected drop returns to the menu with "Connection lost", or
   auto-reconnects to the last server when auto-connect is on. A server
   `Q` (shutdown) does the same. Manual **Disconnect** never reconnects.
-- While the in-stream HOME menu is open the decoder is stopped and a
-  neutral input report is sent — every remote key, stick, touch and click
-  is released until **Resume**.
+- While the in-stream menu is open (5 s HOME hold) the decoder is stopped
+  and a neutral input report is sent — every remote key, stick, touch and
+  click is released until **Resume**.
+- **HOME shortcuts** are resolved by a non-blocking state machine
+  (`pad/home_keys.c`): a short tap is sent as a remote HOME press+release
+  pulse on release; a 5 s hold opens the local menu once; HOME+X sends a
+  `'T'` mode request; HOME+Up/Down step the physical backlight; combo
+  partners are masked from the remote report while HOME is held so no
+  constituent leaks. HOME+B keeps its 2 s emergency exit.
 
 ## Input transmitted (server maps to X11)
 
 Buttons, sticks (deadzone + rest calibration), touch (10-sample average,
 calibrated to 854×480), accelerometer/gyro, mic, volume slider. Details:
-docs/ARCHITECTURE.md. The GamePad **HOME** button is consumed locally and
-never reaches the desktop.
+docs/ARCHITECTURE.md. A **short HOME tap is forwarded** to the server
+(bindable in ThinServer Settings); only the local shortcut combinations
+stay on the GamePad.
