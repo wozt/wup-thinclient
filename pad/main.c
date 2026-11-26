@@ -8,6 +8,7 @@
  *
  * Protocol (UDP, little endian). The pad listens on port 50000.
  *   pad -> broadcast:50001  'B' version 1 0                      every second while no server is connected
+ *     (direct endpoints: unicast 'B' to host:port instead)
  *   server -> pad   'H' version flags(1 = send the microphone) light  hello / keepalive (every 250 ms); light: the
  *                                                                 backlight 1..6 (0 = leave it), bit 6 = off, bit 7 = keep it
  *                'V' flags(1 = keyframe) 0 0, u32 frame, u32 offset, u32 total, then <= 1400 bytes
@@ -28,6 +29,7 @@
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
+#include <netdb.h>
 #include "wup.h"
 #include "armcpu.h"
 #include "wup_hw.h"                                   /* (hw_backlight_percent: the table's levels) */
@@ -45,48 +47,86 @@ typedef uint8_t u8; typedef uint16_t u16; typedef uint32_t u32;
 static u32 ms_, last_clk, frac;
 static u32 clock_ms(void) { u32 c = CLOCK; frac += c - last_clk; last_clk = c; ms_ += frac / 997; frac %= 997; return ms_; }
 
-/* ---- local configuration: the WUP ThinServer IP ("" = any) ----------------- */
+/* ---- local configuration: the WUP ThinServer endpoint ----------------------
+   server_host is a DNS name or dotted quad; "" = LAN broadcast discovery.
+   server_port is the UDP port the server listens on for 'B' beacons
+   (default 50001). Direct endpoints are reached by unicast 'B' beacons;
+   the server answers from its observed source endpoint, so no inbound
+   port forwarding is needed on the GamePad's network (cone NAT). */
 #define CFG_PATH "/save/thinclient.cfg"
-static char server_ip[16];          /* dotted quad or "" for any server */
+#define SERVER_HOST_MAX 48
+static char server_host[SERVER_HOST_MAX];
+static int server_port = 50001;
+static u32 server_addr;             /* resolved IPv4 for direct mode, 0 = none */
 static int auto_connect;            /* connect on start and after a lost stream */
 
 static void cfg_load(void) {
-    server_ip[0] = 0;
+    server_host[0] = 0;
+    server_port = 50001;
     auto_connect = 0;
+    server_addr = 0;
     if (!wup_fs_ok()) return;
-    char buf[96];
+    char buf[160];
     memset(buf, 0, sizeof buf);
     int n = fs_read(CFG_PATH, 0, buf, (u32)sizeof buf - 1);
     if (n <= 0) return;
     buf[sizeof buf - 1] = 0;
-    /* first whitespace-separated token is the IP ("any" = no filter);
-       auto_connect is a later "auto=1" token for backward compatibility */
-    int i = 0;
-    while (i < (int)sizeof buf - 1 && buf[i] && buf[i] != ' ' && buf[i] != '\n' && buf[i] != '\r') i++;
-    if (i > 0 && i < (int)sizeof server_ip) {
-        if (i == 3 && !memcmp(buf, "any", 3)) {
-            server_ip[0] = 0;
-        } else {
-            memcpy(server_ip, buf, (size_t)i);
-            server_ip[i] = 0;
+    /* whitespace-separated tokens: a bare token is the host ("any" = LAN
+       discovery, backward compatible with the old bare-IP format);
+       port=N and auto=N are key=value tokens */
+    char *save = NULL;
+    for (char *tok = strtok_r(buf, " \t\r\n", &save); tok;
+         tok = strtok_r(NULL, " \t\r\n", &save)) {
+        if (!strncmp(tok, "port=", 5)) {
+            int p = atoi(tok + 5);
+            if (p >= 1 && p <= 65535) server_port = p;
+        } else if (!strncmp(tok, "auto=", 5)) {
+            if (tok[5] == '1') auto_connect = 1;
+        } else if (!strchr(tok, '=')) {
+            if (!strcmp(tok, "any")) server_host[0] = 0;
+            else {
+                size_t l = strlen(tok);
+                if (l >= sizeof server_host) l = sizeof server_host - 1;
+                memcpy(server_host, tok, l);
+                server_host[l] = 0;
+            }
         }
     }
-    if (strstr(buf, "auto=1")) auto_connect = 1;
 }
 
 static void cfg_save(void) {
     if (!wup_fs_ok()) return;
-    char buf[40];
-    snprintf(buf, sizeof buf, "%s auto=%d",
-             server_ip[0] ? server_ip : "any", auto_connect);
+    char buf[96];
+    snprintf(buf, sizeof buf, "%s port=%d auto=%d",
+             server_host[0] ? server_host : "any", server_port, auto_connect);
     fs_write(CFG_PATH, buf, (u32)strlen(buf) + 1);
+}
+
+/* Resolve the configured endpoint once per connect attempt. Numeric IPv4
+   literals resolve locally; names go through lwIP DNS (blocking, bounded
+   by the resolver's own timeouts). Returns 1 when server_addr is usable
+   or when LAN discovery mode is selected. */
+static int resolve_server(void) {
+    server_addr = 0;
+    if (!server_host[0]) return 1;
+    struct addrinfo hints, *res = NULL;
+    memset(&hints, 0, sizeof hints);
+    hints.ai_family = AF_INET;
+    hints.ai_socktype = SOCK_DGRAM;
+    char port[6];
+    snprintf(port, sizeof port, "%d", server_port);
+    if (getaddrinfo(server_host, port, &hints, &res) != 0 || !res) return 0;
+    struct sockaddr_in *sa = (struct sockaddr_in *)res->ai_addr;
+    server_addr = sa->sin_addr.s_addr;
+    freeaddrinfo(res);
+    return server_addr != 0;
 }
 
 static u32 conn_target;                          /* forward: used by ip_matches */
 static int ip_matches(const struct sockaddr_in *from) {
     if (conn_target) return from->sin_addr.s_addr == conn_target;
-    if (!server_ip[0]) return 1;                    /* any server */
-    return from->sin_addr.s_addr == inet_addr(server_ip);
+    if (!server_host[0]) return 1;                    /* any server */
+    return server_addr && from->sin_addr.s_addr == server_addr;
 }
 
 /* ---- local UI state --------------------------------------------------------- */
@@ -99,7 +139,7 @@ static u32 conn_deadline;                        /* connect attempt timeout */
 static int next_state = ST_MENU;                 /* where end_session() lands */
 static u32 last_peer_ip;                         /* last server that streamed */
 static int quit_app;                             /* menu Exit / emergency quit */
-static char edit_ip[16];                         /* keypad edit buffer, never heap-allocated */
+static char edit_ip[SERVER_HOST_MAX];            /* keypad edit buffer, never heap-allocated */
 static int edit_sel;                             /* optional D-pad keypad selection */
 static int edit_touch = -1, edit_hover = -1;     /* touch-down key and current key */
 
@@ -428,7 +468,7 @@ static void menu_item(int i, int y, int h, const char *label, int sel) {
 
 static void draw_server_line(void) {
     char line[64];
-    if (server_ip[0]) snprintf(line, sizeof line, "Server: %s", server_ip);
+    if (server_host[0]) snprintf(line, sizeof line, "Server: %s:%d", server_host, server_port);
     else snprintf(line, sizeof line, "Server: any (first found)");
     gfx_text_c(&font_body, GFX_W / 2, 168, line, RGB(255, 255, 255));
 }
@@ -441,7 +481,7 @@ static void draw_menu(void) {
     if (status_msg[0])
         gfx_text_c(&font_body, GFX_W / 2, 232, status_msg, RGB(255, 210, 120));
     char any[48], ac[40];
-    snprintf(any, sizeof any, "Use any server%s", server_ip[0] ? "" : " (selected)");
+    snprintf(any, sizeof any, "Use any server%s", server_host[0] ? "" : " (selected)");
     snprintf(ac, sizeof ac, "Auto-connect: %s", auto_connect ? "on" : "off");
     const char *labels[] = { "Connect", "Edit server address", any, ac, "Exit" };
     mi_n = 0;
@@ -458,8 +498,8 @@ static void draw_connecting(void) {
     char line[64];
     if (conn_target)
         snprintf(line, sizeof line, "Reconnecting to %s ...", inet_ntoa((struct in_addr){ conn_target }));
-    else if (server_ip[0])
-        snprintf(line, sizeof line, "Looking for %s ...", server_ip);
+    else if (server_host[0])
+        snprintf(line, sizeof line, "Looking for %s:%d ...", server_host, server_port);
     else
         snprintf(line, sizeof line, "Looking for any WUP ThinServer ...");
     gfx_text_c(&font_body, GFX_W / 2, 260, line, RGB(255, 255, 255));
@@ -522,7 +562,11 @@ static void menu_activate(int sel) {
     switch (sel) {
     case 0:  /* Connect */
         if (!net_ok) { snprintf(status_msg, sizeof status_msg, "No Wi-Fi connection"); draw_menu(); return; }
-        conn_target = server_ip[0] ? inet_addr(server_ip) : 0;
+        if (!resolve_server()) {
+            snprintf(status_msg, sizeof status_msg, "Cannot resolve %s", server_host);
+            draw_menu(); return;
+        }
+        conn_target = server_addr;
         start_connecting(conn_target, "press B to cancel");
         return;
     case 1:  /* Edit server address */
@@ -531,7 +575,8 @@ static void menu_activate(int sel) {
         draw_edit();
         return;
     case 2:  /* Explicit any-server selection */
-        server_ip[0] = 0;
+        server_host[0] = 0;
+        server_addr = 0;
         cfg_save();
         snprintf(status_msg, sizeof status_msg, "Any-server mode selected");
         draw_menu();
@@ -610,7 +655,7 @@ static void draw_edit(void) {
 }
 
 static void edit_from_saved(void) {
-    snprintf(edit_ip, sizeof edit_ip, "%s", server_ip);
+    snprintf(edit_ip, sizeof edit_ip, "%s", server_host);
     edit_sel = 0;
     edit_touch = edit_hover = -1;
 }
@@ -628,7 +673,7 @@ static void edit_activate(int key) {
     else if (key == EDIT_CLEAR) edit_ip[0] = 0;
     else if (key == EDIT_SAVE) {
         if (!ip_editor_valid(edit_ip)) return;
-        snprintf(server_ip, sizeof server_ip, "%s", edit_ip);
+        snprintf(server_host, sizeof server_host, "%s", edit_ip);
         cfg_save();
         edit_leave("Server address saved");
         return;
@@ -744,7 +789,11 @@ static void tick(u32 now) {                               /* every 1-2 ms */
            the disconnected menu must not broadcast readiness */
         if (state == ST_CONNECTING && now - beacon_ms >= 1000) {
             static const u8 b[4] = { 'B', 1 };
-            struct sockaddr_in to = { .sin_family = AF_INET, .sin_port = htons(50001), .sin_addr.s_addr = 0xffffffffu };
+            /* direct endpoint: unicast 'B' to the resolved server; LAN
+               discovery: broadcast 'B' to every listener on server_port */
+            struct sockaddr_in to = { .sin_family = AF_INET,
+                .sin_port = htons((u16)server_port),
+                .sin_addr.s_addr = server_addr ? server_addr : 0xffffffffu };
             send_to(&to, b, 4); beacon_ms = now;
         }
         return;
@@ -861,8 +910,14 @@ int main(void) {
     menu_sel = 0;
     if (net_ok && auto_connect) {
         state = ST_CONNECTING;
-        conn_target = server_ip[0] ? inet_addr(server_ip) : 0;
-        conn_deadline = clock_ms() + 15000;
+        if (resolve_server()) {
+            conn_target = server_addr;
+            conn_deadline = clock_ms() + 15000;
+        } else {
+            state = ST_MENU; menu_sel = 0;
+            snprintf(status_msg, sizeof status_msg, "Cannot resolve %s", server_host);
+            draw_menu();
+        }
         status_msg[0] = 0;
         draw_connecting();
     } else {
