@@ -1,23 +1,29 @@
 # Testing
 
-## Automated (host)
+## Automated (host, from repo root)
 
 ```sh
-python3 -m unittest discover -s tests -v
+make test        # = python3 -m unittest discover -s tests -v
 ```
 
 Current coverage: config-file format parsing/validation (the format the
-app persists), build-config sanity (`app.cfg` flags). Packet/frame logic
-inside `pad/main.c` is hardware-tied and cannot run on the host — it is
-covered indirectly by the shared upstream implementation, which was stable
-in WUP Stream.
+app persists at `/save/thinclient.cfg`) and `app.cfg` sanity. The
+packet/frame logic in `pad/main.c` is hardware-tied and cannot run on the
+host; it is shared with the stable upstream implementation.
+
+## Build reproducibility
+
+`make clean && make` from a fresh clone
+(`git clone --recurse-submodules`) must produce
+`build/apps/wup_thinclient.wup`. The SDK fetches its own pinned
+dependencies on first build.
 
 ## Hardware validation checklist (GamePad required)
 
 | # | Check | Expected |
 |---|---|---|
-| 1 | Boot .wup from Homebrew Menu | local menu appears, no crash |
-| 2 | Y → set IP, B save, power-cycle app | config persists |
+| 1 | Deploy with `make deploy`, launch from NetFS | local menu appears, no crash |
+| 2 | Y → set IP, B save, relaunch | config persists |
 | 3 | Connect to ThinServer | video+audio within ~2 s |
 | 4 | Touch screen | pointer moves/clicks remotely |
 | 5 | Sticks scroll, ZL/ZR click | input reaches X11 |

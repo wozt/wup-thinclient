@@ -4,3 +4,5 @@
 *.wup
 *.zip
 AGENTS.md
+__pycache__/
+*.pyc

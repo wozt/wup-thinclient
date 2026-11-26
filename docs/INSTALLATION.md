@@ -1,25 +1,29 @@
 # Installation (Wii U GamePad)
 
 Prerequisites: firmware 7677 (required for this toolchain), a host PC on the
-same LAN, the wup-homebrew Homebrew Menu installed.
+same LAN, the wup-homebrew Homebrew Menu installed, and the NetFS share
+(`~/wup-share` on this machine) reachable from the GamePad.
 
-## Steps
+## Build and deploy
 
-1. Build `wup_thinclient.wup` (see docs/BUILD.md).
-2. Deliver it to the GamePad:
-   - `python3 libwup/tools/wuplink.py build/apps/wup_thinclient.wup`, then
-     press **Y** in the Homebrew Menu to keep + launch; or
-   - copy it into the Homebrew Menu `apps/` folder on the GamePad storage.
-3. Make sure the WUP ThinServer is running on the same network.
-4. Launch **WUP ThinClient** from the Homebrew Menu.
+```sh
+cd wup-thinclient
+make setup && make && make deploy
+```
 
-## First connection
+`make deploy` copies `build/apps/wup_thinclient.wup` to
+`~/wup-share/wup_thinclient.wup` (override: `WUP_SHARE_DIR=...`). It verifies
+the artifact is non-empty, replaces the destination atomically, and checks
+the SHA256 checksum.
 
-- Waiting screen shows status and the configured server.
-- Press **Y** → IP editor. D-pad/Left-Right move between octets, Up/Down
-  ±1 (±10 while holding L/R), A next octet, B save, X toggles "any server".
-- Config is stored on the GamePad's flash (`/save/thinclient.cfg`) and
-  survives restarts.
+## Launch
+
+1. On the GamePad, browse the NetFS share and start `wup_thinclient.wup`
+   from the Homebrew Menu.
+2. Make sure the WUP ThinServer is running on the same network.
+3. Waiting screen → press **Y** to set the server IP (or leave "any
+   server"), **B** to save. Config persists on the GamePad flash
+   (`/save/thinclient.cfg`).
 
 ## Emergency exit
 
