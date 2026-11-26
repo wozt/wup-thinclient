@@ -33,6 +33,7 @@
 #include "wup_hw.h"                                   /* (hw_backlight_percent: the table's levels) */
 #include "fs.h"                                       /* saved server configuration */
 #include "ip_editor.h"
+#include "home_keys.h"                               /* HOME shortcut state machine */
 
 WUP_APP("WUP ThinClient");
 typedef uint8_t u8; typedef uint16_t u16; typedef uint32_t u32;
@@ -101,6 +102,15 @@ static int quit_app;                             /* menu Exit / emergency quit *
 static char edit_ip[16];                         /* keypad edit buffer, never heap-allocated */
 static int edit_sel;                             /* optional D-pad keypad selection */
 static int edit_touch = -1, edit_hover = -1;     /* touch-down key and current key */
+
+/* ---- HOME shortcuts + live input-mode switching ('T' packets) -------------- */
+static home_keys_t hk;
+static u8 remote_mode = 0xff;                    /* 'H' byte 4: 0 gamepad, 1 desktop, 0xff unknown */
+static u8 mode_reqid;                            /* 'T' request sequence (0 = unused) */
+static u32 mode_req_deadline;                    /* ack timeout */
+static int mode_req_pending;
+static char mode_notice[96];                     /* last mode-switch result, shown in menus */
+static u32 mode_notice_ms;
 
 /* ---- the server ------------------------------------------------------------- */
 static int net_ok;
@@ -365,6 +375,32 @@ static void local_light_step(int delta) {
 }
 /* No periodic backlight writes: only explicit commands and session exit. */
 
+/* ---- 'T' input-mode requests (HOME+X) ---------------------------------------
+   mode byte: 0 gamepad, 1 desktop (the server's INMODE_* values), 0xff toggle.
+   The ack carries the EFFECTIVE mode; remote_mode tracks the 'H' byte 4
+   hint so repeated presses always request the opposite of what runs. */
+static void mode_request(u32 now) {
+    u8 want = remote_mode == 0xff ? 0xff : (u8)(remote_mode == 1 ? 0 : 1);
+    mode_reqid++;
+    if (!mode_reqid) mode_reqid++;
+    u8 t[4] = { 'T', mode_reqid, want, 0 };
+    send_peer(t, sizeof t);
+    mode_req_pending = 1;
+    mode_req_deadline = now + 2500;
+    snprintf(mode_notice, sizeof mode_notice, "Requesting %s mode...",
+             want == 0xff ? "other input" : want == 0 ? "Gamepad" : "Desktop");
+    mode_notice_ms = now;
+    wup_log("thinclient: input mode request sent");
+}
+static void mode_timeout(u32 now) {
+    if (!mode_req_pending || (int)(now - mode_req_deadline) < 0) return;
+    mode_req_pending = 0;
+    snprintf(mode_notice, sizeof mode_notice,
+             "Mode switch unanswered (old server?)");
+    mode_notice_ms = now;
+    wup_log("thinclient: mode request timed out");
+}
+
 /* ---- local screens ------------------------------------------------------------ */
 static void draw_brand(int y, const char *sub) {
     gfx_vgrad24(0, 0, GFX_W, GFX_H, C24(16, 32, 64), C24(5, 8, 20));
@@ -412,7 +448,7 @@ static void draw_menu(void) {
     for (int i = 0; i < 5; i++)
         menu_item(mi_n++, 246 + i * 40, 34, labels[i], menu_sel == i);
     gfx_text_c(&font_small, GFX_W / 2, 480 - 18,
-               "D-pad + A   touch   B: quit   HOME+B: quit", RGB(120, 135, 170));
+               "D-pad + A   touch   B: quit   HOME+B: quit   hold HOME 5 s: menu", RGB(120, 135, 170));
     gfx_present_all();
 }
 
@@ -442,22 +478,33 @@ static void draw_ingame(void) {
         gfx_text_c(&font_body, GFX_W / 2, 140, "Controls (set on the server)", RGB(190, 205, 230));
         static const char *const rows[] = {
             "Touch   pointer / tap / drag / scroll",
-            "Left stick   mouse move",
-            "Right stick  scroll",
+            "Left stick   mouse move     Right stick  scroll",
             "ZL / L3   left mouse     ZR / R3   right mouse",
             "A Enter   B Esc   X keyboard   Y Alt+Tab",
             "L / R   workspace prev/next   D-pad   arrows",
             "Plus / Minus   zoom   TV   fullscreen",
-            "HOME   this menu   HOME+B   quit app",
+            "HOME tap   remote HOME (bindable on server)",
+            "HOME 5 s   this menu     HOME+X   Desktop/Gamepad",
+            "HOME+Up/Down   screen brightness     HOME+B   quit",
         };
-        for (int i = 0; i < 8; i++)
-            gfx_text_c(&font_small, GFX_W / 2, 190 + i * 30, rows[i], RGB(170, 185, 215));
+        for (int i = 0; i < 9; i++)
+            gfx_text_c(&font_small, GFX_W / 2, 178 + i * 28, rows[i], RGB(170, 185, 215));
         gfx_text_c(&font_small, GFX_W / 2, 460, "B: back", RGB(120, 135, 170));
     } else {
         draw_server_line();
+        /* effective input mode + last mode-switch result ('T' ack / 'H' hint) */
+        char mline[100];
+        const char *mname = remote_mode == 0 ? "Gamepad" : remote_mode == 1 ? "Desktop" : "?";
+        u32 now = clock_ms();
+        if (mode_notice[0] &&
+            (mode_req_pending || (int)(now - mode_notice_ms) < 15000))
+            snprintf(mline, sizeof mline, "Mode: %s - %s", mname, mode_notice);
+        else
+            snprintf(mline, sizeof mline, "Mode: %s", mname);
+        gfx_text_c(&font_small, GFX_W / 2, 148, mline, RGB(140, 190, 235));
         mi_n = 0;
         for (int i = 0; i < 5; i++)
-            menu_item(mi_n++, 170 + i * 48, 40, ingame_labels[i], menu_sel == i);
+            menu_item(mi_n++, 176 + i * 46, 38, ingame_labels[i], menu_sel == i);
         gfx_text_c(&font_small, GFX_W / 2, 460, "stream paused - remote input suspended", RGB(120, 135, 170));
     }
     gfx_present_all();
@@ -601,6 +648,8 @@ static void end_session(void) {
     if (light_override) wup_backlight(wup_backlight_level());
     light_off = 0; light_level = 0; light_override = 0;
     peer_on = von = sync = npend = 0; need_idr = 1; wp = 0;
+    hk_reset(&hk);
+    mode_req_pending = 0;
     diag_event(41, 0, 0);
     diag_active = 0;
     int was = shown;
@@ -622,6 +671,7 @@ static void packet(const u8 *d, u32 len, const struct sockaddr_in *from, u32 now
            The explicit IP is a selection filter, not authentication. */
         if (!ip_matches(from)) return;
         peer_sa = *from; peer_on = 1; need_idr = 1; frames = keys = lost = resent = stalls = full = gap_max = qmax = 0; stat_ms = t_start = now;
+        hk_reset(&hk);
         last_peer_ip = from->sin_addr.s_addr;
         state = ST_STREAMING;
         rbase = VDEC(0x24) & 0xffffff; rsize = (VDEC(0x28) & 0xffffff) - rbase; wp = 0;
@@ -631,7 +681,28 @@ static void packet(const u8 *d, u32 len, const struct sockaddr_in *from, u32 now
     }
     if (!peer_on || from->sin_addr.s_addr != peer_sa.sin_addr.s_addr || from->sin_port != peer_sa.sin_port) return;
     last_ms = now;
-    if (h[0] == 'H') { mic(h[2] & 1); light(h[3]); }      /* (hello: byte 2 bit 0 = the microphone, byte 3 = the backlight) */
+    if (h[0] == 'H') {
+        mic(h[2] & 1); light(h[3]);
+        /* 5th hello byte (new servers): the effective input mode */
+        if (len >= 5 && h[4] <= 1) remote_mode = h[4];
+    }
+    if (h[0] == 'T' && len >= 4 && mode_req_pending && h[1] == mode_reqid) {
+        /* ack to our 'T' request: status 0 applied / 1 rejected / 2 invalid,
+           byte 3 is the server's effective mode — authoritative */
+        mode_req_pending = 0;
+        int status = h[2], eff = h[3];
+        if (eff <= 1) remote_mode = (u8)eff;
+        if (status == 0)
+            snprintf(mode_notice, sizeof mode_notice, "Input mode: %s",
+                     eff == 0 ? "Gamepad" : "Desktop");
+        else if (status == 2)
+            snprintf(mode_notice, sizeof mode_notice, "Mode request rejected");
+        else
+            snprintf(mode_notice, sizeof mode_notice,
+                     "Still %s - Gamepad unavailable", eff == 0 ? "Gamepad" : "Desktop");
+        mode_notice_ms = now;
+        wup_log("thinclient: mode switch acknowledged");
+    }
     if (h[0] == 'V' && n == 16 && state != ST_INGAME) video(d + 16, len, h, now);
     else if (h[0] == 'A' && len > 8) audio(d + 8, len);
     else if (h[0] == 'R') motor(h[1] & 1, now);
@@ -717,7 +788,11 @@ static void tick(u32 now) {                               /* every 1-2 ms */
         }
         for (int i = 0; i < 128; i++) m[8 + i] = rep[i];
         unsigned buttons = ((unsigned)m[10] << 8) | m[11];
-        if (buttons & WUP_HOME) buttons &= ~(WUP_HOME | WUP_UP | WUP_DOWN);   /* HOME is local: never remote */
+        /* HOME shortcuts (home_keys.c): standalone presses become a remote
+           pulse on release; combo partners are masked while HOME is held.
+           In the local menu nothing remote may leak, HOME included. */
+        buttons = hk_filter(&hk, (u16)buttons, now);
+        if (state == ST_INGAME) buttons &= (u16)~HK_HOME;
         m[10] = (u8)(buttons >> 8); m[11] = (u8)buttons;
         send_peer(m, sizeof m); in_seq = seq; in_ms = now;
     }
@@ -841,6 +916,19 @@ int main(void) {
         }
         if (quit_app) break;
 
+        /* HOME shortcut engine: polled every iteration while a session
+           exists so edge tracking stays exact; events act only while the
+           stream is live (the local menu keeps its own controls). */
+        unsigned hk_ev = 0;
+        if (peer_on) hk_poll(&hk, b, now, &hk_ev);
+        mode_timeout(now);
+        if (hk_ev && state == ST_STREAMING) {
+            if (hk_ev & HK_EV_MENU)       enter_ingame();
+            if (hk_ev & HK_EV_MODE)       mode_request(now);
+            if (hk_ev & HK_EV_BRIGHT_UP)  local_light_step(1);
+            if (hk_ev & HK_EV_BRIGHT_DN)  local_light_step(-1);
+        }
+
         /* connect attempt timed out: back to the menu */
         if (state == ST_CONNECTING && !peer_on && (int)(now - conn_deadline) >= 0) {
             state = ST_MENU; menu_sel = 0;
@@ -883,7 +971,8 @@ int main(void) {
                 draw_menu();
             }
         } else if (state == ST_STREAMING) {
-            if (pressed & WUP_HOME) enter_ingame();
+            /* HOME is no longer a menu hotkey: short press forwards remotely,
+               5 s hold opens this menu (hk_poll above), combos act locally */
         } else if (state == ST_INGAME) {
             if (ingame_sub) {
                 if (pressed & WUP_B) { ingame_sub = 0; draw_ingame(); }

@@ -42,6 +42,8 @@ test:
 	@mkdir -p build/tests
 	@cc -std=c11 -Wall -Wextra -Werror -Ipad pad/ip_editor.c tests/test_ip_editor.c -o build/tests/test_ip_editor
 	@build/tests/test_ip_editor
+	@cc -std=c11 -Wall -Wextra -Werror -Ipad pad/home_keys.c tests/test_home_keys.c -o build/tests/test_home_keys
+	@build/tests/test_home_keys
 	@python3 -m unittest discover -s tests -v
 
 clean:
