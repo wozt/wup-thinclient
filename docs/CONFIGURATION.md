@@ -19,9 +19,18 @@ configuration (desktop, quality, input map) lives in WUP ThinServer's
 | Remote HOME | **HOME** short tap | forwarded to ThinServer — bindable like any button |
 
 `thinclient.cfg` format (one line, whitespace-separated tokens):
-`<ip-or-any> auto=<0|1>`, e.g. `192.168.1.10 auto=0` or `any auto=1`.
-Files written by older builds (bare IP only) still load — auto-connect
-defaults to off.
+`<host-or-any> port=<1-65535> auto=<0|1>`, e.g.
+`192.168.1.10 port=50001 auto=0`, `thinserver.home.lan port=5080 auto=1`
+or `any auto=1`. `<host>` is a DNS name or dotted IPv4; `any` selects LAN
+broadcast discovery. `port` defaults to 50001. Files written by older
+builds (bare IP + `auto=`) still load unchanged.
+
+Direct endpoints: when a host is configured the client unicasts `B`
+beacons to `host:port` (resolved once per attempt via lwIP DNS) instead
+of broadcasting, and only that server address may answer. The server
+replies from its observed source endpoint, so no inbound port forwarding
+is needed on the GamePad's network (cone-type NAT; symmetric NAT is not
+supported). DNS failures and timeouts show as menu status messages.
 
 ## Connection behavior
 
