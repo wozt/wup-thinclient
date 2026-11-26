@@ -46,45 +46,63 @@ static u32 clock_ms(void) { u32 c = CLOCK; frac += c - last_clk; last_clk = c; m
 /* ---- local configuration: the WUP ThinServer IP ("" = any) ----------------- */
 #define CFG_PATH "/save/thinclient.cfg"
 static char server_ip[16];          /* dotted quad or "" for any server */
+static int auto_connect;            /* connect on start and after a lost stream */
 
 static void cfg_load(void) {
     server_ip[0] = 0;
+    auto_connect = 0;
     if (!wup_fs_ok()) return;
-    char buf[64];
+    char buf[96];
     memset(buf, 0, sizeof buf);
     int n = fs_read(CFG_PATH, 0, buf, (u32)sizeof buf - 1);
     if (n <= 0) return;
     buf[sizeof buf - 1] = 0;
-    /* first whitespace-separated token is the IP */
+    /* first whitespace-separated token is the IP ("any" = no filter);
+       auto_connect is a later "auto=1" token for backward compatibility */
     int i = 0;
     while (i < (int)sizeof buf - 1 && buf[i] && buf[i] != ' ' && buf[i] != '\n' && buf[i] != '\r') i++;
     if (i > 0 && i < (int)sizeof server_ip) {
-        memcpy(server_ip, buf, (size_t)i);
-        server_ip[i] = 0;
+        if (i == 3 && !memcmp(buf, "any", 3)) {
+            server_ip[0] = 0;
+        } else {
+            memcpy(server_ip, buf, (size_t)i);
+            server_ip[i] = 0;
+        }
     }
+    if (strstr(buf, "auto=1")) auto_connect = 1;
 }
 
 static void cfg_save(void) {
     if (!wup_fs_ok()) return;
-    fs_write(CFG_PATH, server_ip, (u32)strlen(server_ip) + 1);
+    char buf[40];
+    snprintf(buf, sizeof buf, "%s auto=%d",
+             server_ip[0] ? server_ip : "any", auto_connect);
+    fs_write(CFG_PATH, buf, (u32)strlen(buf) + 1);
 }
 
+static u32 conn_target;                          /* forward: used by ip_matches */
 static int ip_matches(const struct sockaddr_in *from) {
+    if (conn_target) return from->sin_addr.s_addr == conn_target;
     if (!server_ip[0]) return 1;                    /* any server */
     return from->sin_addr.s_addr == inet_addr(server_ip);
 }
 
-/* ---- the screen while no server streams ------------------------------------ */
-static int net_ok;
-
 /* ---- local UI state --------------------------------------------------------- */
-enum { UI_NORMAL, UI_EDIT_IP };
-static int ui_mode;
-static int edit_field;                            /* 0..3 octet, 4 = "any" toggle */
+enum { ST_MENU, ST_EDIT, ST_CONNECTING, ST_STREAMING, ST_INGAME };
+static int state = ST_MENU;
+static int menu_sel;                             /* menu row / ingame row */
+static int ingame_sub;                           /* 0 = actions, 1 = controls help */
+static char status_msg[80];                      /* menu status line */
+static u32 conn_deadline;                        /* connect attempt timeout */
+static int next_state = ST_MENU;                 /* where end_session() lands */
+static u32 last_peer_ip;                         /* last server that streamed */
+static int quit_app;                             /* menu Exit / emergency quit */
+static int edit_field;                           /* 0..3 octet, 4 = "any" toggle */
 static int edit_val[4];
-static int edit_any;                              /* editing "any server" mode */
+static int edit_any;                             /* editing "any server" mode */
 
 /* ---- the server ------------------------------------------------------------- */
+static int net_ok;
 static int sock = -1;
 static struct sockaddr_in peer_sa;
 static u32 peer_on, last_ms, quiet_until, beacon_ms, in_ms, stat_ms;
@@ -353,24 +371,130 @@ static void draw_brand(int y, const char *sub) {
     if (sub) gfx_text_c(&font_body, GFX_W / 2, y + 44, sub, RGB(190, 200, 225));
 }
 
-static void draw_waiting(void) {
-    wup_screen();
-    char sub[96];
-    if (!net_ok) {
-        gfx_text_c(&font_body, GFX_W / 2, 270, "No Wi-Fi", RGB(255, 255, 255));
-        gfx_text_c(&font_body, GFX_W / 2, 310, "Connect to Wi-Fi in the Homebrew Menu's Settings", RGB(190, 200, 225));
+/* ---- menu geometry (shared by drawing and touch hit-testing) ----------------- */
+static void draw_edit(void);
+static void edit_from_saved(void);
+#define MI_MAX 8
+static int mi_y[MI_MAX], mi_h[MI_MAX], mi_n;
+
+static void menu_item(int i, int y, int h, const char *label, int sel) {
+    mi_y[i] = y; mi_h[i] = h;
+    if (sel) {
+        gfx_rrect(GFX_W / 2 - 210, y, 420, h, 10, RGB(46, 96, 168), 220);
+        gfx_rrect_outline(GFX_W / 2 - 210, y, 420, h, 10, 2, RGB(120, 190, 255));
+        gfx_text_c(&font_body, GFX_W / 2, y + h / 2 + 7, label, RGB(255, 255, 255));
     } else {
-        draw_brand(190, NULL);
-        if (server_ip[0]) {
-            snprintf(sub, sizeof sub, "Looking for server %s", server_ip);
-        } else {
-            snprintf(sub, sizeof sub, "Any WUP ThinServer on this network");
-        }
-        gfx_text_c(&font_body, GFX_W / 2, 260, sub, RGB(255, 255, 255));
-        gfx_text_c(&font_body, GFX_W / 2, 300, wup_net_ip_str(), RGB(150, 165, 200));
-        gfx_text_c(&font_body, GFX_W / 2, 360, "Y: set server   B: menu   HOME+B: quit", RGB(150, 165, 200));
+        gfx_rrect(GFX_W / 2 - 210, y, 420, h, 10, RGB(24, 32, 52), 200);
+        gfx_text_c(&font_body, GFX_W / 2, y + h / 2 + 7, label, RGB(190, 205, 230));
+    }
+}
+
+static void draw_server_line(void) {
+    char line[64];
+    if (server_ip[0]) snprintf(line, sizeof line, "Server: %s", server_ip);
+    else snprintf(line, sizeof line, "Server: any (first found)");
+    gfx_text_c(&font_body, GFX_W / 2, 168, line, RGB(255, 255, 255));
+}
+
+static void draw_menu(void) {
+    wup_screen();
+    draw_brand(84, "Linux desktop on the GamePad");
+    draw_server_line();
+    gfx_text_c(&font_small, GFX_W / 2, 196, wup_net_ip_str(), RGB(140, 155, 190));
+    if (status_msg[0])
+        gfx_text_c(&font_body, GFX_W / 2, 232, status_msg, RGB(255, 210, 120));
+    char ac[40];
+    snprintf(ac, sizeof ac, "Auto-connect: %s", auto_connect ? "on" : "off");
+    static const char *const labels[] = { "Connect", "Edit server address", NULL, "Exit" };
+    mi_n = 0;
+    for (int i = 0; i < 4; i++) {
+        const char *lb = labels[i] ? labels[i] : ac;
+        menu_item(mi_n++, 268 + i * 46, 38, lb, menu_sel == i);
+    }
+    gfx_text_c(&font_small, GFX_W / 2, 480 - 18,
+               "D-pad + A   touch   B: quit   HOME+B: quit", RGB(120, 135, 170));
+    gfx_present_all();
+}
+
+static void draw_connecting(void) {
+    wup_screen();
+    draw_brand(170, NULL);
+    char line[64];
+    if (conn_target)
+        snprintf(line, sizeof line, "Reconnecting to %s ...", inet_ntoa((struct in_addr){ conn_target }));
+    else if (server_ip[0])
+        snprintf(line, sizeof line, "Looking for %s ...", server_ip);
+    else
+        snprintf(line, sizeof line, "Looking for any WUP ThinServer ...");
+    gfx_text_c(&font_body, GFX_W / 2, 260, line, RGB(255, 255, 255));
+    gfx_text_c(&font_small, GFX_W / 2, 300, wup_net_ip_str(), RGB(140, 155, 190));
+    gfx_text_c(&font_small, GFX_W / 2, 340, status_msg[0] ? status_msg : "press B to cancel", RGB(120, 135, 170));
+    gfx_present_all();
+}
+
+static const char *const ingame_labels[] = { "Resume", "Disconnect", "Reconnect", "Controls", "Exit" };
+
+static void draw_ingame(void) {
+    wup_screen();
+    gfx_vgrad24(0, 0, GFX_W, GFX_H, C24(10, 16, 34), C24(4, 6, 16));
+    gfx_text_c(&font_title, GFX_W / 2, 92, "WUP ThinClient", RGB(120, 200, 255));
+    if (ingame_sub) {
+        gfx_text_c(&font_body, GFX_W / 2, 140, "Controls (set on the server)", RGB(190, 205, 230));
+        static const char *const rows[] = {
+            "Touch   pointer / tap / drag / scroll",
+            "Left stick   mouse move",
+            "Right stick  scroll",
+            "ZL / L3   left mouse     ZR / R3   right mouse",
+            "A Enter   B Esc   X keyboard   Y Alt+Tab",
+            "L / R   workspace prev/next   D-pad   arrows",
+            "Plus / Minus   zoom   TV   fullscreen",
+            "HOME   this menu   HOME+B   quit app",
+        };
+        for (int i = 0; i < 8; i++)
+            gfx_text_c(&font_small, GFX_W / 2, 190 + i * 30, rows[i], RGB(170, 185, 215));
+        gfx_text_c(&font_small, GFX_W / 2, 460, "B: back", RGB(120, 135, 170));
+    } else {
+        draw_server_line();
+        mi_n = 0;
+        for (int i = 0; i < 5; i++)
+            menu_item(mi_n++, 170 + i * 48, 40, ingame_labels[i], menu_sel == i);
+        gfx_text_c(&font_small, GFX_W / 2, 460, "stream paused - remote input suspended", RGB(120, 135, 170));
     }
     gfx_present_all();
+}
+
+static void start_connecting(u32 target, const char *msg) {
+    conn_target = target;
+    conn_deadline = clock_ms() + 15000;
+    state = ST_CONNECTING;
+    snprintf(status_msg, sizeof status_msg, "%s", msg ? msg : "");
+    draw_connecting();
+}
+
+static void menu_activate(int sel) {
+    switch (sel) {
+    case 0:  /* Connect */
+        if (!net_ok) { snprintf(status_msg, sizeof status_msg, "No Wi-Fi connection"); draw_menu(); return; }
+        conn_target = server_ip[0] ? inet_addr(server_ip) : 0;
+        start_connecting(conn_target, "press B to cancel");
+        return;
+    case 1:  /* Edit server address */
+        edit_from_saved();
+        state = ST_EDIT;
+        draw_edit();
+        return;
+    case 2:  /* Auto-connect toggle */
+        auto_connect = !auto_connect;
+        cfg_save();
+        status_msg[0] = 0;
+        draw_menu();
+        return;
+    case 3:  /* Exit */
+        wup_log("thinclient: exit from menu");
+        state = ST_MENU;
+        quit_app = 1;
+        return;
+    }
 }
 
 static void draw_edit(void) {
@@ -388,7 +512,7 @@ static void draw_edit(void) {
                edit_any ? "X: fixed address" : "X: any server",
                RGB(150, 165, 200));
     gfx_text_c(&font_body, GFX_W / 2, 400,
-               "Left/Right: octet   Up/Down: +/-1   L/R: +/-10   A: next   B: save", RGB(150, 165, 200));
+               "Left/Right: octet   Up/Down: +/-1   L/R: +/-10   A: next   B: save & back", RGB(150, 165, 200));
     gfx_present_all();
 }
 
@@ -423,27 +547,34 @@ static void end_session(void) {
     diag_event(40, wp, von);
     if (von) stop_engine();
     VDEC(0x0c) = 0;
-    if (shown) { gfx_brightness(0); draw_waiting(); LCD(0x80) = lcd80; }   /* (our screen was the decoder's: draw it again, dark) */
     motor(0, 0); mic(0);
     light_now = 0;
     if (light_override) wup_backlight(wup_backlight_level());
     light_off = 0; light_level = 0; light_override = 0;
     peer_on = von = sync = npend = 0; need_idr = 1; wp = 0;
-    if (shown) gfx_fade(0, 256);
-    shown = 0;
     diag_event(41, 0, 0);
     diag_active = 0;
+    int was = shown;
+    if (was) { gfx_brightness(0); LCD(0x80) = lcd80; shown = 0; }
+    state = next_state;
+    menu_sel = ingame_sub = 0;
     wup_log("thinclient: session ended");
+    if (state == ST_CONNECTING) draw_connecting();
+    else draw_menu();
+    if (was) gfx_fade(0, 256);
 }
 static void packet(const u8 *d, u32 len, const struct sockaddr_in *from, u32 now) {
     u8 h[16] __attribute__((aligned(4)));
     u32 n = len < 16 ? len : 16;
     memcpy(h, d, n);
     if (n < 4 || (int)(now - quiet_until) < 0) return;
-    if (!peer_on && h[0] == 'H') {
-        /* WUP ThinClient: only the configured server may start a session. */
+    if (!peer_on && h[0] == 'H' && state == ST_CONNECTING) {
+        /* WUP ThinClient: only the configured server may start a session.
+           The explicit IP is a selection filter, not authentication. */
         if (!ip_matches(from)) return;
         peer_sa = *from; peer_on = 1; need_idr = 1; frames = keys = lost = resent = stalls = full = gap_max = qmax = 0; stat_ms = t_start = now;
+        last_peer_ip = from->sin_addr.s_addr;
+        state = ST_STREAMING;
         rbase = VDEC(0x24) & 0xffffff; rsize = (VDEC(0x28) & 0xffffff) - rbase; wp = 0;
         diag_active = 1;
         diag_event(42, rbase, rsize);
@@ -452,17 +583,46 @@ static void packet(const u8 *d, u32 len, const struct sockaddr_in *from, u32 now
     if (!peer_on || from->sin_addr.s_addr != peer_sa.sin_addr.s_addr || from->sin_port != peer_sa.sin_port) return;
     last_ms = now;
     if (h[0] == 'H') { mic(h[2] & 1); light(h[3]); }      /* (hello: byte 2 bit 0 = the microphone, byte 3 = the backlight) */
-    if (h[0] == 'V' && n == 16) video(d + 16, len, h, now);
+    if (h[0] == 'V' && n == 16 && state != ST_INGAME) video(d + 16, len, h, now);
     else if (h[0] == 'A' && len > 8) audio(d + 8, len);
     else if (h[0] == 'R') motor(h[1] & 1, now);
-    else if (h[0] == 'Q') { end_session(); quiet_until = now + 1000; }
+    else if (h[0] == 'Q') {
+        /* the server ended the session: reconnect when auto-connect is on */
+        if (auto_connect) {
+            next_state = ST_CONNECTING;
+            conn_target = last_peer_ip;
+            snprintf(status_msg, sizeof status_msg, "Server ended - reconnecting");
+        } else {
+            next_state = ST_MENU;
+            snprintf(status_msg, sizeof status_msg, "Server ended the session");
+        }
+        end_session();
+        quiet_until = now + 1000;
+        conn_deadline = now + 15000;
+    }
 }
+static void peer_lost(u32 now) {
+    if (auto_connect) {
+        next_state = ST_CONNECTING;
+        conn_target = last_peer_ip;
+        snprintf(status_msg, sizeof status_msg, "Connection lost - reconnecting");
+    } else {
+        next_state = ST_MENU;
+        snprintf(status_msg, sizeof status_msg, "Connection to server lost");
+    }
+    end_session();
+    quiet_until = now + 1000;
+    conn_deadline = now + 15000;
+}
+
 static void tick(u32 now) {                               /* every 1-2 ms */
     if (now - poll_ms > gap_max && poll_ms) gap_max = now - poll_ms;
     poll_ms = now;
-    if (peer_on && now - last_ms > 1500) end_session();  /* the server is gone */
+    if (peer_on && now - last_ms > 1500) peer_lost(now);
     if (!peer_on) {
-        if (now - beacon_ms >= 1000) {
+        /* beacons only while a connection is actually being attempted:
+           the disconnected menu must not broadcast readiness */
+        if (state == ST_CONNECTING && now - beacon_ms >= 1000) {
             static const u8 b[4] = { 'B', 1 };
             struct sockaddr_in to = { .sin_family = AF_INET, .sin_port = htons(50001), .sin_addr.s_addr = 0xffffffffu };
             send_to(&to, b, 4); beacon_ms = now;
@@ -493,13 +653,62 @@ static void tick(u32 now) {                               /* every 1-2 ms */
         u8 m[8 + 128] = { 'I', (u8)(need_idr | (von ? waiting() << 1 : 0)) };
         u32 since = CLOCK - LCD(0xfc);                       /* ticks since the screen's last refresh (it latches the clock) */
         m[2] = (u8)since; m[3] = (u8)(since >> 8); m[4] = (u8)(light_off ? 0 : level_now());
-        for (int i = 0; i < 128; i++) m[8 + i] = REPORT[i];
-        unsigned buttons = ((unsigned)m[10] << 8) | m[11];
-        if ((buttons & WUP_HOME) && (buttons & (WUP_UP | WUP_DOWN))) {
-            buttons &= ~(WUP_HOME | WUP_UP | WUP_DOWN);
-            m[10] = (u8)(buttons >> 8); m[11] = (u8)buttons;
+        const volatile u8 *rep = REPORT;
+        u8 neutral[128];
+        if (state == ST_INGAME) {                           /* local menu: release everything remote */
+            for (int i = 0; i < 128; i++) neutral[i] = REPORT[i];
+            memset(neutral + 2, 0, 2);                      /* buttons */
+            neutral[0x50] = 0;                              /* L3 / R3 / TV clicks */
+            for (int i = 0; i < 4; i++) {                   /* sticks back to rest (0x800) */
+                neutral[6 + 2 * i] = 0x00; neutral[7 + 2 * i] = 0x08;
+            }
+            memset(neutral + 15, 0, 12);                    /* accel + gyro (gyro drives a stick) */
+            memset(neutral + 36, 0, 40);                    /* touch samples: all invalid */
+            rep = neutral;
         }
+        for (int i = 0; i < 128; i++) m[8 + i] = rep[i];
+        unsigned buttons = ((unsigned)m[10] << 8) | m[11];
+        if (buttons & WUP_HOME) buttons &= ~(WUP_HOME | WUP_UP | WUP_DOWN);   /* HOME is local: never remote */
+        m[10] = (u8)(buttons >> 8); m[11] = (u8)buttons;
         send_peer(m, sizeof m); in_seq = seq; in_ms = now;
+    }
+}
+
+static int menu_hit(int x, int y) {
+    for (int i = 0; i < mi_n; i++)
+        if (x >= GFX_W / 2 - 210 && x <= GFX_W / 2 + 210 && y >= mi_y[i] && y < mi_y[i] + mi_h[i])
+            return i;
+    return -1;
+}
+
+static void enter_ingame(void) {
+    state = ST_INGAME; menu_sel = 0; ingame_sub = 0;
+    if (von) stop_engine();
+    VDEC(0x0c) = 0;
+    von = 0; need_idr = 1; npend = 0; sync = 0;      /* decoder idle; resync on resume */
+    in_ms = 0;                                    /* neutral report out within a tick */
+    if (shown) { gfx_brightness(0); LCD(0x80) = lcd80; }   /* UI layer back over the frozen frame */
+    draw_ingame();
+    gfx_fade(0, 256);
+}
+
+static void resume_stream(void) {
+    state = ST_STREAMING;
+    need_idr = 1;                                 /* next 'I' asks for a keyframe: decoder restarts */
+    if (shown) LCD(0x80) = (lcd80 | 4) & ~0x10;  /* video scan path back: last frame until new ones */
+}
+
+static void ingame_activate(int sel) {
+    switch (sel) {
+    case 0: resume_stream(); break;
+    case 1: next_state = ST_MENU; snprintf(status_msg, sizeof status_msg, "Disconnected");
+            end_session(); break;
+    case 2: next_state = ST_CONNECTING; conn_target = last_peer_ip;
+            snprintf(status_msg, sizeof status_msg, "Reconnecting ...");
+            conn_deadline = clock_ms() + 15000;
+            end_session(); break;
+    case 3: ingame_sub = 1; draw_ingame(); break;
+    case 4: quit_app = 1; break;
     }
 }
 
@@ -524,9 +733,22 @@ int main(void) {
             diag_thread = wup_thread_start(diag_worker, NULL, 2048, 1);
         }
     }
-    ui_mode = UI_NORMAL;
-    draw_waiting();
+    /* start in the connection menu; auto-connect skips straight to dialing */
+    menu_sel = 0;
+    if (net_ok && auto_connect) {
+        state = ST_CONNECTING;
+        conn_target = server_ip[0] ? inet_addr(server_ip) : 0;
+        conn_deadline = clock_ms() + 15000;
+        status_msg[0] = 0;
+        draw_connecting();
+    } else {
+        state = ST_MENU;
+        status_msg[0] = 0;
+        if (!net_ok) snprintf(status_msg, sizeof status_msg, "No Wi-Fi - use the Homebrew Menu Settings");
+        draw_menu();
+    }
     unsigned held = wup_buttons();
+    int touch_prev = 0;
     u32 quit_combo_since = 0;
     int quit_combo_active = 0;
     static u8 buf[1536] __attribute__((aligned(4)));
@@ -549,10 +771,36 @@ int main(void) {
             tick(clock_ms());
         }
         unsigned b = wup_buttons(), pressed = b & ~held;
+        int tx = 0, ty = 0, tnow = wup_touch(&tx, &ty);
+        int tpress = tnow && !touch_prev;
+        touch_prev = tnow;
+
+        /* Local emergency exit: HOME + B continuously for 2 seconds.
+           Never intercept either key alone; reset timer when either is released.
+           u32 subtraction handles clock_ms() wraparound. */
+        if ((b & (WUP_HOME | WUP_B)) == (WUP_HOME | WUP_B)) {
+            if (!quit_combo_active) {
+                quit_combo_active = 1;
+                quit_combo_since = now;
+            } else if ((u32)(now - quit_combo_since) >= 2000u) {
+                wup_log("thinclient: quit via HOME+B");
+                quit_app = 1;
+            }
+        } else {
+            quit_combo_active = 0;
+        }
+        if (quit_app) break;
+
+        /* connect attempt timed out: back to the menu */
+        if (state == ST_CONNECTING && !peer_on && (int)(now - conn_deadline) >= 0) {
+            state = ST_MENU; menu_sel = 0;
+            snprintf(status_msg, sizeof status_msg, "No answer from server");
+            draw_menu();
+        }
 
         /* ---- local UI ---------------------------------------------------- */
-        if (ui_mode == UI_EDIT_IP) {
-            if (pressed & WUP_B) { edit_save(); ui_mode = UI_NORMAL; draw_waiting(); }
+        if (state == ST_EDIT) {
+            if (pressed & WUP_B) { edit_save(); state = ST_MENU; menu_sel = 0; status_msg[0] = 0; draw_menu(); }
             else if (pressed & WUP_X) { edit_any = !edit_any; draw_edit(); }
             else if (pressed & WUP_LEFT)  { if (edit_field > 0) edit_field--; draw_edit(); }
             else if (pressed & WUP_RIGHT) { if (edit_field < 3) edit_field++; draw_edit(); }
@@ -572,31 +820,33 @@ int main(void) {
             held = b;
             continue;
         }
-        if (!peer_on && (pressed & WUP_Y)) {
-            edit_from_saved();
-            ui_mode = UI_EDIT_IP;
-            draw_edit();
-            held = b;
-            continue;
-        }
-        /* HOME while streaming: local menu is a later milestone; keep the
-           upstream HOME+UP/DOWN backlight and HOME+B quit behaviour. */
-
-        /* Local emergency exit: HOME + B continuously for 2 seconds.
-           Never intercept either key alone; reset timer when either is released.
-           u32 subtraction handles clock_ms() wraparound. */
-        if ((b & (WUP_HOME | WUP_B)) == (WUP_HOME | WUP_B)) {
-            if (!quit_combo_active) {
-                quit_combo_active = 1;
-                quit_combo_since = now;
-            } else if ((u32)(now - quit_combo_since) >= 2000u) {
-                wup_log("thinclient: quit via HOME+B");
-                break;
+        if (state == ST_MENU) {
+            int hit = tpress ? menu_hit(tx, ty) : -1;
+            if (hit >= 0) { menu_sel = hit; menu_activate(hit); }
+            else if (pressed & WUP_UP)    { menu_sel = (menu_sel + 3) % 4; draw_menu(); }
+            else if (pressed & WUP_DOWN)  { menu_sel = (menu_sel + 1) % 4; draw_menu(); }
+            else if (pressed & WUP_A)     { menu_activate(menu_sel); }
+            else if (pressed & WUP_B)     { quit_app = 1; }
+        } else if (state == ST_CONNECTING) {
+            if (pressed & WUP_B) {
+                state = ST_MENU; menu_sel = 0;
+                snprintf(status_msg, sizeof status_msg, "Cancelled");
+                draw_menu();
             }
-        } else {
-            quit_combo_active = 0;
+        } else if (state == ST_STREAMING) {
+            if (pressed & WUP_HOME) enter_ingame();
+        } else if (state == ST_INGAME) {
+            if (ingame_sub) {
+                if (pressed & WUP_B) { ingame_sub = 0; draw_ingame(); }
+            } else {
+                int hit = tpress ? menu_hit(tx, ty) : -1;
+                if (hit >= 0) { menu_sel = hit; ingame_activate(hit); }
+                else if (pressed & WUP_UP)   { menu_sel = (menu_sel + 4) % 5; draw_ingame(); }
+                else if (pressed & WUP_DOWN) { menu_sel = (menu_sel + 1) % 5; draw_ingame(); }
+                else if (pressed & WUP_A)    { ingame_activate(menu_sel); }
+                else if (pressed & WUP_B)    { resume_stream(); }
+            }
         }
-        /* B alone while waiting: nothing (no menu app to return to). */
         held = b;
     }
     if (peer_on) end_session();

@@ -22,15 +22,16 @@ dependencies on first build.
 
 | # | Check | Expected |
 |---|---|---|
-| 1 | Deploy with `make deploy`, launch from NetFS | local menu appears, no crash |
-| 2 | Y → set IP, B save, relaunch | config persists |
-| 3 | Connect to ThinServer | video+audio within ~2 s |
+| 1 | Deploy with `make deploy`, launch from NetFS | **connection menu** appears (no auto-stream), no crash |
+| 2 | Menu → Edit server address, set IP, B save & back | config persists; still no stream |
+| 3 | Menu → Connect | "Looking for …" then video+audio within ~15 s |
 | 4 | Touch screen | pointer moves/clicks remotely |
-| 5 | Sticks scroll, ZL/ZR click | input reaches X11 |
-| 6 | X toggles Onboard | keyboard shows/hides |
-| 7 | HOME+B 2 s | app exits, session stays alive server-side |
-| 8 | Reconnect | desktop state preserved |
-| 9 | 10-min stream | no freeze, memory stable |
-| 10 | Wi-Fi loss/recovery | clean resync or return to menu |
+| 5 | Left stick = pointer, right stick = scroll, ZL/ZR/L3/R3 = mouse buttons | desktop input reaches X11, no WASD/arrows from sticks |
+| 6 | X toggles Onboard | keyboard shows/hides, repeats alternate |
+| 7 | HOME while streaming → menu | stream pauses, Resume/Disconnect/Reconnect/Controls/Exit work; remote input released while open |
+| 8 | HOME menu → Disconnect | back to menu, no auto-reconnect, desktop session alive server-side |
+| 9 | HOME+B 2 s | app exits, session stays alive server-side |
+| 10 | Auto-connect on + Wi-Fi loss/recovery | auto-reconnect to last server, or clean return to menu |
+| 11 | 10-min stream | no freeze, memory stable |
 
 Never report hardware results without actually running them.

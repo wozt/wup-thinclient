@@ -32,12 +32,17 @@ Derived from `wup-stream/pad/main.c` @ `e1b0430`. Unchanged core:
 
 Added for ThinClient:
 
-- `cfg_load`/`cfg_save`: server IP persisted at `/save/thinclient.cfg`
-  (littlefs flash via libwup `fs_*`).
-- `ip_matches`: the `H` handshake is accepted only from the configured
-  server; empty config = any server (upstream behaviour).
-- Local UI: `UI_NORMAL` waiting screen + `UI_EDIT_IP` octet editor
-  (Y to open, X any-server toggle, B save).
+- `cfg_load`/`cfg_save`: server IP + auto-connect flag persisted at
+  `/save/thinclient.cfg` (littlefs flash via libwup `fs_*`).
+- Connection state machine (`ST_MENU`/`ST_EDIT`/`ST_CONNECTING`/
+  `ST_STREAMING`/`ST_INGAME`): beacons and `H` acceptance only happen in
+  `ST_CONNECTING`; the menu never broadcasts readiness. The configured IP
+  is a selection filter (plus `conn_target` pinning for reconnects), not
+  authentication.
+- Local UI: connection menu (Connect / Edit / Auto-connect / Exit,
+  touch + d-pad), octet IP editor, and an in-stream HOME menu that pauses
+  the decoder and sends a neutral input report (all remote inputs
+  released) until Resume.
 - Branding: "WUP ThinClient", own `app.cfg` (name/author/url/icon).
 
 ## Memory budget
@@ -58,8 +63,9 @@ wup-thinserver `docs/CONFIGURATION.md` for the default GamePad→desktop map
 
 ## Recovery
 
-- Server silent >1.5 s → `end_session()` → back to waiting screen; the
-  Linux session keeps running server-side.
+- Server silent >1.5 s → `peer_lost()` → auto-reconnect (when enabled)
+  or back to the menu; the Linux session keeps running server-side.
+- Server `Q` → same path (reconnect when auto-connect is on).
 - Decoder stall >60 ms → keyframe request (`need_idr`) via `I` flags.
 - Lost fragments → `N` NACKs; >45 ms incomplete → resync.
 - HOME+B 2 s → local quit (always available, even with no server).

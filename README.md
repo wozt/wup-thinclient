@@ -50,18 +50,38 @@ Menu / NetFS browser. See [docs/INSTALLATION.md](docs/INSTALLATION.md).
 
 ## Local interface
 
-- **Waiting screen**: shows the configured server (or "any server"), this
-  GamePad's IP, and hints.
-- **Y** (while waiting): edit the server address — d-pad/L/R move between
-  octets, Up/Down ±1 (±10 with L/R held), A next, B save, X toggle
-  "any server" (`*.*.*.*`). Saved to `/save/thinclient.cfg` on the
-  GamePad's flash.
+The app **never streams on its own**: it opens a connection menu and waits
+for an explicit **Connect**.
+
+- **Menu**: WUP ThinClient branding, configured server (or "any server"),
+  this GamePad's IP, connection status, and items **Connect / Edit server
+  address / Auto-connect / Exit**. D-pad + A, or tap the touchscreen.
+- **Edit server address**: four octets — Left/Right pick the octet,
+  Up/Down ±1 (±10 with L/R held), A next field, B save & back, X toggle
+  "any server". Saved to `/save/thinclient.cfg` on the GamePad's flash
+  together with the auto-connect flag. Saving never connects by itself.
+- **Connect**: beacons for up to 15 s; the first matching ThinServer's
+  hello starts the stream. B cancels. With "any server" the first
+  ThinServer that answers wins — the IP is a *selection filter*, not
+  authentication.
+- **Auto-connect** (menu toggle, off by default): connect automatically on
+  launch and retry automatically after an unexpected drop.
+- **In-stream HOME menu**: Resume / Disconnect / Reconnect / Controls /
+  Exit. While it is open the stream pauses (decoder stopped, next
+  keyframe resumes it) and **all remote input is released** — nothing you
+  press reaches the desktop until you resume.
+- **Disconnect / loss**: manual disconnect returns to the menu and stops
+  reconnecting; an unexpected drop retries only when auto-connect is on,
+  otherwise shows "Connection lost" in the menu. The Linux desktop stays
+  alive either way.
 - **HOME+B held 2 s** force-quits the app (local emergency exit).
 
 ## Status
 
-Prototype — builds reproducibly to `build/apps/wup_thinclient.wup`,
-**not yet validated on physical hardware**.
+Builds reproducibly to `build/apps/wup_thinclient.wup` and deploys to the
+NetFS share. **Core streaming validated on physical GamePad hardware**
+(desktop visible and usable, developer-reported); the connection menu and
+in-stream HOME menu are new and pending physical retest.
 See [docs/PROJECT_STATUS.md](docs/PROJECT_STATUS.md).
 
 ## License
