@@ -39,10 +39,10 @@ Added for ThinClient:
   `ST_CONNECTING`; the menu never broadcasts readiness. The configured IP
   is a selection filter (plus `conn_target` pinning for reconnects), not
   authentication.
-- Local UI: connection menu (Connect / Edit / Auto-connect / Exit,
-  touch + d-pad), octet IP editor, and an in-stream HOME menu that pauses
-  the decoder and sends a neutral input report (all remote inputs
-  released) until Resume.
+- Local UI: connection menu (Connect / Edit / Use any server / Auto-connect /
+  Exit, touch + d-pad), touchscreen numeric IPv4 keypad, and an in-stream
+  HOME menu that pauses the decoder and sends a neutral input report (all
+  remote inputs released) until Resume.
 - Branding: "WUP ThinClient", own `app.cfg` (name/author/url/icon).
 
 ## Memory budget

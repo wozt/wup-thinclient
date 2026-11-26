@@ -5,7 +5,8 @@
 | GamePad homebrew (adapted pad client) | Implemented |
 | Connection state machine + menu (Connect/Edit/Auto-connect/Exit) | Implemented — pending hardware retest |
 | Explicit-connect flow: no streaming until Connect; no beacons while disconnected | Implemented — pending hardware retest |
-| Server IP editor (4 octets, any-server mode) + persistence | Implemented |
+| Touchscreen IPv4 keypad (validation, Save/Cancel, pressed feedback) | Implemented — pending hardware validation |
+| Explicit any-server menu action + persistence | Implemented — pending hardware validation |
 | Auto-connect option (off by default) + auto-reconnect on loss | Implemented — pending hardware retest |
 | In-stream HOME menu (Resume/Disconnect/Reconnect/Controls/Exit) | Implemented — pending hardware retest |
 | Remote-input release while local menu open (neutral report) | Implemented — pending hardware retest |
@@ -19,4 +20,4 @@
 | Connection menu / HOME menu / auto-show keyboard on hardware | Pending physical retest |
 | 60 fps sustained | Not measured |
 
-Last updated: desktop-usability milestone.
+Last updated: input-usability milestone (touchscreen IPv4 keypad).

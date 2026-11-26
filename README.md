@@ -55,11 +55,14 @@ for an explicit **Connect**.
 
 - **Menu**: WUP ThinClient branding, configured server (or "any server"),
   this GamePad's IP, connection status, and items **Connect / Edit server
-  address / Auto-connect / Exit**. D-pad + A, or tap the touchscreen.
-- **Edit server address**: four octets — Left/Right pick the octet,
-  Up/Down ±1 (±10 with L/R held), A next field, B save & back, X toggle
-  "any server". Saved to `/save/thinclient.cfg` on the GamePad's flash
-  together with the auto-connect flag. Saving never connects by itself.
+  address / Use any server / Auto-connect / Exit**. D-pad + A, or tap the
+  touchscreen.
+- **Edit server address**: large touchscreen numeric keypad with decimal
+  point, backspace, clear, validated Save and non-destructive Cancel.
+  Saved to `/save/thinclient.cfg` on the GamePad's flash together with the
+  auto-connect flag. Saving never connects by itself.
+- **Use any server**: explicit menu action; the first matching ThinServer
+  to answer is selected.
 - **Connect**: beacons for up to 15 s; the first matching ThinServer's
   hello starts the stream. B cancels. With "any server" the first
   ThinServer that answers wins — the IP is a *selection filter*, not

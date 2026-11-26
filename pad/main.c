@@ -32,6 +32,7 @@
 #include "armcpu.h"
 #include "wup_hw.h"                                   /* (hw_backlight_percent: the table's levels) */
 #include "fs.h"                                       /* saved server configuration */
+#include "ip_editor.h"
 
 WUP_APP("WUP ThinClient");
 typedef uint8_t u8; typedef uint16_t u16; typedef uint32_t u32;
@@ -97,9 +98,9 @@ static u32 conn_deadline;                        /* connect attempt timeout */
 static int next_state = ST_MENU;                 /* where end_session() lands */
 static u32 last_peer_ip;                         /* last server that streamed */
 static int quit_app;                             /* menu Exit / emergency quit */
-static int edit_field;                           /* 0..3 octet, 4 = "any" toggle */
-static int edit_val[4];
-static int edit_any;                             /* editing "any server" mode */
+static char edit_ip[16];                         /* keypad edit buffer, never heap-allocated */
+static int edit_sel;                             /* optional D-pad keypad selection */
+static int edit_touch = -1, edit_hover = -1;     /* touch-down key and current key */
 
 /* ---- the server ------------------------------------------------------------- */
 static int net_ok;
@@ -403,14 +404,13 @@ static void draw_menu(void) {
     gfx_text_c(&font_small, GFX_W / 2, 196, wup_net_ip_str(), RGB(140, 155, 190));
     if (status_msg[0])
         gfx_text_c(&font_body, GFX_W / 2, 232, status_msg, RGB(255, 210, 120));
-    char ac[40];
+    char any[48], ac[40];
+    snprintf(any, sizeof any, "Use any server%s", server_ip[0] ? "" : " (selected)");
     snprintf(ac, sizeof ac, "Auto-connect: %s", auto_connect ? "on" : "off");
-    static const char *const labels[] = { "Connect", "Edit server address", NULL, "Exit" };
+    const char *labels[] = { "Connect", "Edit server address", any, ac, "Exit" };
     mi_n = 0;
-    for (int i = 0; i < 4; i++) {
-        const char *lb = labels[i] ? labels[i] : ac;
-        menu_item(mi_n++, 268 + i * 46, 38, lb, menu_sel == i);
-    }
+    for (int i = 0; i < 5; i++)
+        menu_item(mi_n++, 246 + i * 40, 34, labels[i], menu_sel == i);
     gfx_text_c(&font_small, GFX_W / 2, 480 - 18,
                "D-pad + A   touch   B: quit   HOME+B: quit", RGB(120, 135, 170));
     gfx_present_all();
@@ -483,13 +483,19 @@ static void menu_activate(int sel) {
         state = ST_EDIT;
         draw_edit();
         return;
-    case 2:  /* Auto-connect toggle */
+    case 2:  /* Explicit any-server selection */
+        server_ip[0] = 0;
+        cfg_save();
+        snprintf(status_msg, sizeof status_msg, "Any-server mode selected");
+        draw_menu();
+        return;
+    case 3:  /* Auto-connect toggle */
         auto_connect = !auto_connect;
         cfg_save();
         status_msg[0] = 0;
         draw_menu();
         return;
-    case 3:  /* Exit */
+    case 4:  /* Exit */
         wup_log("thinclient: exit from menu");
         state = ST_MENU;
         quit_app = 1;
@@ -497,50 +503,93 @@ static void menu_activate(int sel) {
     }
 }
 
+enum { EDIT_BACK = 11, EDIT_CLEAR, EDIT_SAVE, EDIT_CANCEL, EDIT_COUNT };
+
+static void edit_button_rect(int key, int *x, int *y, int *w, int *h) {
+    if (key < 12) {
+        *x = 80 + (key % 3) * 120;
+        *y = 170 + (key / 3) * 65;
+        *w = 108; *h = 54;
+    } else {
+        *x = 470; *y = 170 + (key - 12) * 82;
+        *w = 304; *h = 70;
+    }
+}
+
+static int edit_button_at(int x, int y) {
+    for (int key = 0; key < EDIT_COUNT; key++) {
+        int bx, by, bw, bh;
+        edit_button_rect(key, &bx, &by, &bw, &bh);
+        if (x >= bx && x < bx + bw && y >= by && y < by + bh) return key;
+    }
+    return -1;
+}
+
+static const char *edit_button_label(int key) {
+    static const char *const labels[] = {
+        "1", "2", "3", "4", "5", "6", "7", "8", "9",
+        ".", "0", "Backspace", "Clear", "Save", "Cancel"
+    };
+    return labels[key];
+}
+
 static void draw_edit(void) {
     wup_screen();
-    draw_brand(120, "Server address (dotted quad)");
-    char line[48];
-    if (edit_any) {
-        gfx_text_c(&font_big, GFX_W / 2, 260, "*.*.*.*", RGB(120, 220, 140));
-    } else {
-        snprintf(line, sizeof line, "%3d . %3d . %3d . %3d",
-                 edit_val[0], edit_val[1], edit_val[2], edit_val[3]);
-        gfx_text_c(&font_big, GFX_W / 2, 260, line, RGB(255, 255, 255));
+    draw_brand(38, "Enter a fixed IPv4 address");
+    int valid = ip_editor_valid(edit_ip);
+    gfx_rrect(80, 104, 694, 50, 9, RGB(18, 28, 48), 230);
+    gfx_rrect_outline(80, 104, 694, 50, 9, 2,
+                      valid ? RGB(100, 210, 145) : RGB(105, 125, 165));
+    gfx_text_c(&font_big, GFX_W / 2, 140, edit_ip[0] ? edit_ip : "_", RGB(255, 255, 255));
+
+    for (int key = 0; key < EDIT_COUNT; key++) {
+        int x, y, w, h, down = key == edit_touch && key == edit_hover;
+        int disabled = key == EDIT_SAVE && !valid;
+        edit_button_rect(key, &x, &y, &w, &h);
+        px_t fill = disabled ? RGB(36, 42, 54) : down ? RGB(74, 138, 210) :
+                    key == edit_sel ? RGB(46, 96, 168) : RGB(24, 38, 62);
+        px_t text = disabled ? RGB(95, 105, 125) : RGB(240, 246, 255);
+        gfx_rrect(x, y, w, h, 9, fill, 230);
+        if (!disabled && (down || key == edit_sel))
+            gfx_rrect_outline(x, y, w, h, 9, 2, RGB(130, 205, 255));
+        gfx_text_c(key == EDIT_BACK ? &font_small : &font_body,
+                   x + w / 2, y + h / 2 + 7, edit_button_label(key), text);
     }
-    gfx_text_c(&font_body, GFX_W / 2, 340,
-               edit_any ? "X: fixed address" : "X: any server",
-               RGB(150, 165, 200));
-    gfx_text_c(&font_body, GFX_W / 2, 400,
-               "Left/Right: octet   Up/Down: +/-1   L/R: +/-10   A: next   B: save & back", RGB(150, 165, 200));
+    gfx_text_c(&font_small, GFX_W / 2, 462,
+               valid ? "Touch Save, or use D-pad + A   B: Cancel" :
+                       "Enter four octets from 0 to 255   B: Cancel",
+               RGB(145, 165, 200));
     gfx_present_all();
 }
 
 static void edit_from_saved(void) {
-    memset(edit_val, 0, sizeof edit_val);
-    edit_any = !server_ip[0];
-    edit_field = 0;
-    if (!edit_any) {
-        int a = 0, b = 0, c = 0, d = 0;
-        if (sscanf(server_ip, "%d.%d.%d.%d", &a, &b, &c, &d) == 4) {
-            edit_val[0] = a > 255 ? 255 : a < 0 ? 0 : a;
-            edit_val[1] = b > 255 ? 255 : b < 0 ? 0 : b;
-            edit_val[2] = c > 255 ? 255 : c < 0 ? 0 : c;
-            edit_val[3] = d > 255 ? 255 : d < 0 ? 0 : d;
-        } else {
-            edit_any = 1;
-        }
-    }
+    snprintf(edit_ip, sizeof edit_ip, "%s", server_ip);
+    edit_sel = 0;
+    edit_touch = edit_hover = -1;
 }
 
-static void edit_save(void) {
-    if (edit_any) {
-        server_ip[0] = 0;
-    } else {
-        snprintf(server_ip, sizeof server_ip, "%d.%d.%d.%d",
-                 edit_val[0], edit_val[1], edit_val[2], edit_val[3]);
+static void edit_leave(const char *message) {
+    state = ST_MENU; menu_sel = 0;
+    snprintf(status_msg, sizeof status_msg, "%s", message);
+    draw_menu();
+}
+
+static void edit_activate(int key) {
+    static const char digits[] = "123456789.0";
+    if (key >= 0 && key < 11) ip_editor_append(edit_ip, sizeof edit_ip, digits[key]);
+    else if (key == EDIT_BACK) ip_editor_backspace(edit_ip);
+    else if (key == EDIT_CLEAR) edit_ip[0] = 0;
+    else if (key == EDIT_SAVE) {
+        if (!ip_editor_valid(edit_ip)) return;
+        snprintf(server_ip, sizeof server_ip, "%s", edit_ip);
+        cfg_save();
+        edit_leave("Server address saved");
+        return;
+    } else if (key == EDIT_CANCEL) {
+        edit_leave("Address unchanged");
+        return;
     }
-    cfg_save();
+    draw_edit();
 }
 
 static void end_session(void) {
@@ -773,6 +822,7 @@ int main(void) {
         unsigned b = wup_buttons(), pressed = b & ~held;
         int tx = 0, ty = 0, tnow = wup_touch(&tx, &ty);
         int tpress = tnow && !touch_prev;
+        int trelease = !tnow && touch_prev;
         touch_prev = tnow;
 
         /* Local emergency exit: HOME + B continuously for 2 seconds.
@@ -800,31 +850,30 @@ int main(void) {
 
         /* ---- local UI ---------------------------------------------------- */
         if (state == ST_EDIT) {
-            if (pressed & WUP_B) { edit_save(); state = ST_MENU; menu_sel = 0; status_msg[0] = 0; draw_menu(); }
-            else if (pressed & WUP_X) { edit_any = !edit_any; draw_edit(); }
-            else if (pressed & WUP_LEFT)  { if (edit_field > 0) edit_field--; draw_edit(); }
-            else if (pressed & WUP_RIGHT) { if (edit_field < 3) edit_field++; draw_edit(); }
-            else if (pressed & WUP_A)     { if (edit_field < 3) edit_field++; else edit_field = 0; draw_edit(); }
-            else if (pressed & WUP_UP || pressed & WUP_DOWN) {
-                if (!edit_any) {
-                    int d = (pressed & WUP_UP) ? 1 : -1;
-                    /* L/R are checked as HELD buttons: they modify the
-                       up/down step even when pressed before the d-pad. */
-                    if (b & (WUP_L | WUP_R)) d *= 10;
-                    edit_val[edit_field] += d;
-                    if (edit_val[edit_field] > 255) edit_val[edit_field] = 255;
-                    if (edit_val[edit_field] < 0) edit_val[edit_field] = 0;
-                    draw_edit();
-                }
-            }
+            if (tpress) {
+                edit_touch = edit_hover = edit_button_at(tx, ty);
+                if (edit_touch >= 0) { edit_sel = edit_touch; draw_edit(); }
+            } else if (tnow && edit_touch >= 0) {
+                int hover = edit_button_at(tx, ty);
+                if (hover != edit_hover) { edit_hover = hover; draw_edit(); }
+            } else if (trelease && edit_touch >= 0) {
+                int key = edit_touch, activate = edit_hover == edit_touch;
+                edit_touch = edit_hover = -1;
+                if (activate) edit_activate(key); else draw_edit();
+            } else if (pressed & WUP_B) edit_activate(EDIT_CANCEL);
+            else if (pressed & WUP_LEFT)  { if (edit_sel > 0) edit_sel--; draw_edit(); }
+            else if (pressed & WUP_RIGHT) { if (edit_sel + 1 < EDIT_COUNT) edit_sel++; draw_edit(); }
+            else if (pressed & WUP_UP)    { edit_sel = edit_sel >= 3 ? edit_sel - 3 : 0; draw_edit(); }
+            else if (pressed & WUP_DOWN)  { edit_sel = edit_sel + 3 < EDIT_COUNT ? edit_sel + 3 : EDIT_COUNT - 1; draw_edit(); }
+            else if (pressed & WUP_A) edit_activate(edit_sel);
             held = b;
             continue;
         }
         if (state == ST_MENU) {
             int hit = tpress ? menu_hit(tx, ty) : -1;
             if (hit >= 0) { menu_sel = hit; menu_activate(hit); }
-            else if (pressed & WUP_UP)    { menu_sel = (menu_sel + 3) % 4; draw_menu(); }
-            else if (pressed & WUP_DOWN)  { menu_sel = (menu_sel + 1) % 4; draw_menu(); }
+            else if (pressed & WUP_UP)    { menu_sel = (menu_sel + 4) % 5; draw_menu(); }
+            else if (pressed & WUP_DOWN)  { menu_sel = (menu_sel + 1) % 5; draw_menu(); }
             else if (pressed & WUP_A)     { menu_activate(menu_sel); }
             else if (pressed & WUP_B)     { quit_app = 1; }
         } else if (state == ST_CONNECTING) {

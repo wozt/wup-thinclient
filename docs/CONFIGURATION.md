@@ -8,7 +8,8 @@ configuration (desktop, quality, input map) lives in WUP ThinServer's
 
 | Setting | Where | Default |
 |---|---|---|
-| Server address | Menu → **Edit server address** (4 octets, or "any server") | empty = "any server" (first `H` wins) |
+| Server address | Menu → **Edit server address** (touchscreen numeric keypad) | empty = "any server" (first `H` wins) |
+| Any-server mode | Menu → **Use any server** | Explicitly clears the fixed address |
 | Auto-connect | Menu → **Auto-connect** toggle | **off** |
 | Persisted file | `/save/thinclient.cfg` on GamePad flash | — |
 | Emergency quit | **HOME + B** ~2 s (any state) | — |
@@ -23,6 +24,9 @@ defaults to off.
 
 - The app starts in the **menu** and sends no discovery beacons; nothing
   streams until **Connect** is chosen (or auto-connect is on).
+- The address editor only enables **Save** for four complete decimal octets
+  in the 0–255 range. **Cancel** leaves the saved address unchanged. Saving
+  never starts a connection.
 - **Connect** beacons for up to 15 s; the first `H` hello from a matching
   server starts the stream. With "any server" the first ThinServer on the
   LAN wins — the configured IP is a *selection filter*, not

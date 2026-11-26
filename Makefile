@@ -39,6 +39,9 @@ build: build/env.sh
 	@bash $(SCRIPTS)/build.sh
 
 test:
+	@mkdir -p build/tests
+	@cc -std=c11 -Wall -Wextra -Werror -Ipad pad/ip_editor.c tests/test_ip_editor.c -o build/tests/test_ip_editor
+	@build/tests/test_ip_editor
 	@python3 -m unittest discover -s tests -v
 
 clean:
