@@ -23,7 +23,7 @@ configuration (desktop, quality, input map) lives in WUP ThinServer's
 ### Connection profiles
 
 Each profile stores a display **name**, a **host** (DNS name or dotted
-IPv4 — IPv6 is not supported), a **UDP port** (1–65535, default 50001),
+IPv4 — IPv6 is not supported), a **UDP port** (1–65535, default 50002),
 a connection **type** (only UDP today) and an **auto-connect** flag.
 Names allow letters, digits, space, `.`, `-`, `_` (max 31 chars); hosts
 follow DNS label rules (max 253 chars, labels 1–63, no leading/trailing

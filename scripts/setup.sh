@@ -86,7 +86,7 @@ echo "setup: LLVM_BIN = $LLVM_BIN"
 import sys, os
 sys.path.insert(0, 'tools')
 import deps
-deps.fetch('littlefs', 'lwip', 'tinf', 'heatshrink')
+deps.fetch('littlefs', 'lwip', 'tinf')
 PY
 ) || { echo "setup: dependency fetch failed" >&2; exit 1; }
 

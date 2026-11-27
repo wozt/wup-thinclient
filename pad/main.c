@@ -7,7 +7,7 @@
  * wup-thinserver/docs/PROTOCOL.md.
  *
  * Protocol (UDP, little endian). The pad listens on port 50000.
- *   pad -> broadcast:50001  'B' version 1 0                      every second while no server is connected
+ *   pad -> broadcast:50002  'B' version 1 0                      every second while no server is connected
  *     (direct endpoints: unicast 'B' to host:port instead)
  *   server -> pad   'H' version flags(1 = send the microphone) light  hello / keepalive (every 250 ms); light: the
  *                                                                 backlight 1..6 (0 = leave it), bit 6 = off, bit 7 = keep it
@@ -58,7 +58,7 @@ static int cfg_dirty;
 
 /* active endpoint (set when Connect / auto-connect / reconnect fires) */
 static char server_host[PROF_HOST_MAX];
-static int server_port = 50001;
+static int server_port = 50002;
 static u32 server_addr;             /* resolved IPv4 for direct mode, 0 = none */
 static int auto_connect;            /* auto-reconnect after a lost stream */
 
@@ -66,7 +66,7 @@ static void cfg_load(void) {
     prof_init(&profs);
     cfg_dirty = 0;
     server_host[0] = 0;
-    server_port = 50001;
+    server_port = 50002;
     auto_connect = 0;
     server_addr = 0;
     if (!wup_fs_ok()) return;
@@ -82,6 +82,9 @@ static void cfg_load(void) {
         int v = atoi(dp + 7);                  /* skip '\n' + "dport=" */
         if (v >= 1 && v <= 65535) profs.disc_port = v;
     }
+    /* migrate the old shared-discovery default: ThinClient/ThinServer now
+       use 50002 so WUP Stream's 50001 beacons are never answered by them */
+    if (profs.disc_port == 50001) profs.disc_port = 50002;
 }
 
 static void cfg_save(void) {
@@ -676,7 +679,7 @@ static void menu_activate(int sel) {
         memset(&pe_prof, 0, sizeof pe_prof);
         pe_prof.type = PROF_TYPE_UDP;
         pe_port[0] = 0;
-        snprintf(pe_port, sizeof pe_port, "50001");
+        snprintf(pe_port, sizeof pe_port, "50002");
         pe_idx = -1; pe_sel = 0; pe_err = 0; pe_err_msg[0] = 0;
         state = ST_PE;
         draw_pe();

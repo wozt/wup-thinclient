@@ -113,7 +113,7 @@ static void test_serialize_roundtrip(void) {
     profiles_t ps;
     prof_init(&ps);
     prof_t a = { .id = 7, .name = "Home Desktop",
-                 .host = "192.168.1.100", .port = 50001,
+                 .host = "192.168.1.100", .port = 50003,
                  .type = PROF_TYPE_UDP, .auto_connect = 1 };
     prof_t b = { .name = "Cloud", .host = "desktop.example.com",
                  .port = 5080, .type = PROF_TYPE_UDP, .auto_connect = 0 };
@@ -128,14 +128,14 @@ static void test_serialize_roundtrip(void) {
     int n = prof_serialize(&ps, buf, sizeof buf);
     CHECK(n > 0 && (size_t)n < sizeof buf);
     CHECK(strstr(buf, "v=2\n"));
-    CHECK(strstr(buf, "P7|Home Desktop|192.168.1.100|50001|0|1"));
+    CHECK(strstr(buf, "P7|Home Desktop|192.168.1.100|50003|0|1"));
     CHECK(strstr(buf, "P8|Cloud|desktop.example.com|5080|0|0"));
 
     profiles_t ps2;
     CHECK(prof_parse(&ps2, buf, (size_t)n) == 0);
     CHECK(ps2.n == 2);
     CHECK(!strcmp(ps2.p[0].name, "Home Desktop"));
-    CHECK(ps2.p[0].id == 7 && ps2.p[0].port == 50001);
+    CHECK(ps2.p[0].id == 7 && ps2.p[0].port == 50003);
     CHECK(ps2.p[0].auto_connect == 1);
     CHECK(ps2.p[1].id == 8);
     CHECK(ps2.sel == 1);          /* sel resolved by id after P lines */
@@ -151,7 +151,7 @@ static void test_legacy_migration(void) {
     CHECK(prof_parse(&ps, bare, strlen(bare)) == 0);
     CHECK(ps.n == 1);
     CHECK(!strcmp(ps.p[0].host, "192.168.1.50"));
-    CHECK(ps.p[0].port == 50001 && ps.p[0].auto_connect == 0);
+    CHECK(ps.p[0].port == 50002 && ps.p[0].auto_connect == 0);
     CHECK(ps.sel == 0);
 
     /* host port=N auto=1 */
@@ -178,11 +178,32 @@ static void test_legacy_migration(void) {
     CHECK(ps.p[1].id == 3 && ps.p[1].port == 7000);
 }
 
+static void test_port_migration(void) {
+    /* stored 50001 (the old shared WUP Stream/ThinServer discovery port)
+       migrates to ThinServer's dedicated 50002; other ports are kept */
+    profiles_t ps;
+    const char *t = "v=2\nP1|Old|192.168.0.1|50001|0|0\n"
+                    "P2|Custom|192.168.0.2|50001|0|0\n"
+                    "P3|Keep|192.168.0.3|5080|0|0\n";
+    CHECK(prof_parse(&ps, t, strlen(t)) == 0);
+    CHECK(ps.n == 3);
+    CHECK(ps.p[0].port == 50002 && ps.p[1].port == 50002 && ps.p[2].port == 5080);
+
+    /* legacy format: bare host defaults to 50002, explicit 50001 migrates */
+    const char *bare = "192.168.1.50";
+    CHECK(prof_parse(&ps, bare, strlen(bare)) == 0);
+    CHECK(ps.n == 1 && ps.p[0].port == 50002);
+    const char *old = "192.168.1.51 port=50001";
+    CHECK(prof_parse(&ps, old, strlen(old)) == 0);
+    CHECK(ps.n == 1 && ps.p[0].port == 50002);
+}
+
 int main(void) {
     test_validators();
     test_add_del_sel();
     test_serialize_roundtrip();
     test_legacy_migration();
+    test_port_migration();
     if (fails) { printf("%d failures\n", fails); return 1; }
     printf("test_profiles: all passed\n");
     return 0;

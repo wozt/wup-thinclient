@@ -31,7 +31,7 @@ void prof_init(profiles_t *ps) {
     memset(ps, 0, sizeof *ps);
     ps->sel = -1;
     ps->next_id = 1;
-    ps->disc_port = 50001;
+    ps->disc_port = 50002;   /* (50002: WUP ThinServer's own discovery port, away from WUP Stream's 50001) */
 }
 
 static int name_char(int c) {
@@ -200,7 +200,7 @@ static void migrate_legacy(profiles_t *ps, const char *buf, size_t len) {
     memcpy(tmp, buf, len);
     tmp[len] = 0;
     char *host = NULL;
-    int port = 50001, auto_c = 0, is_any = 0;
+    int port = 50002, auto_c = 0, is_any = 0;
     char *p = tmp;
     char *tok;
     while ((tok = next_tok(&p)) != NULL) {
@@ -222,6 +222,7 @@ static void migrate_legacy(profiles_t *ps, const char *buf, size_t len) {
     prof_t np;
     memset(&np, 0, sizeof np);
     np.port = (uint16_t)port;
+    if (np.port == 50001) np.port = 50002;   /* old shared default -> ThinServer port */
     np.type = PROF_TYPE_UDP;
     np.auto_connect = (uint8_t)auto_c;
     size_t hl = strlen(host);
@@ -288,6 +289,7 @@ int prof_parse(profiles_t *ps, const char *buf, size_t len) {
                     memcpy(np.name, name, strlen(name) + 1);
                     memcpy(np.host, host, strlen(host) + 1);
                     np.port = (uint16_t)prof_port_num(portb);
+                    if (np.port == 50001) np.port = 50002;   /* old shared default -> ThinServer port */
                     np.type = (uint8_t)type;
                     np.auto_connect = (uint8_t)au;
                     prof_add(ps, &np);

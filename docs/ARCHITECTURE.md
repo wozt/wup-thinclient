@@ -23,7 +23,7 @@ local connection UI. The desktop, browsers and files live on the server.
 
 Derived from `wup-stream/pad/main.c` @ `e1b0430`. Unchanged core:
 
-- UDP socket :50000, broadcast `B` beacons to :50001.
+- UDP socket :50000, broadcast `B` beacons to :50002 (WUP Stream uses :50001).
 - `H`/`V`/`A`/`R`/`Q` packet handling; `I`/`N`/`M` transmit.
 - Hardware decoder ring management (`VDEC`/`ENG` MMIO), frame reassembly
   (`as[NASM]`), NACK (`nack`), watchdog keyframe recovery.
