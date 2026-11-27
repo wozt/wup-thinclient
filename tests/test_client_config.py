@@ -28,9 +28,12 @@ class TestClientConfig(unittest.TestCase):
 class TestAppCfg(unittest.TestCase):
     def test_cfg_fields(self):
         cfg = (ROOT / 'pad' / 'app.cfg').read_text(encoding='utf-8')
-        for key in ('name', 'net', 'large', 'icon', 'define'):
+        for key in ('name', 'net', 'icon', 'define'):
             self.assertIn(key, cfg)
         self.assertIn('WUP ThinClient', cfg)
+        # V2 decoder/camera owns the screen buffers; the large allocator
+        # would borrow and corrupt that same memory while streaming.
+        self.assertNotIn('large = yes', cfg)
 
 if __name__ == '__main__':
     unittest.main()

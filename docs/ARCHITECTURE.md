@@ -64,10 +64,11 @@ Added for ThinClient:
 ## Memory budget
 
 GamePad: ARM926EJ-S, **4 MiB RAM total**. The V2 build uses the kernel-owned
-decoder and four bounded frame-reassembly buffers. At the audited baseline,
-the app image is 270 KiB, `.bss` ends at `0x117c10`, the heap is 1260 KiB,
-and the packaged artifact is 142892 bytes. There is no per-frame allocation
-in the hot path.
+decoder and four bounded frame-reassembly buffers. It deliberately does not
+enable libwup's `large` allocator: that allocator borrows screen memory which
+the V2 video decoder and camera encoder own while streaming. Camera buffers
+must remain in the ordinary app heap to avoid corrupting decoded frames.
+There is no per-frame allocation in the hot path.
 
 ## Input mapping (what the pad sends)
 

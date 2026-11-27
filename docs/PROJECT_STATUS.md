@@ -6,6 +6,7 @@
 | WUP Homebrew V2.1 + WOZT NetFS SDK migration (`3da1bfa5b3b2`) | Implemented + build-tested |
 | V2 kernel video/input/timing APIs | Implemented + build-tested; physical V2 regression pending |
 | GamePad camera H.264 uplink (`C` fragments / `K` recovery / capability bit) | Implemented + V2 build-tested — server integration and physical validation pending |
+| V2 memory ownership (`large` screen-memory allocator disabled) | Fixed after physical red-frame regression; hardware retest pending |
 | Connection profile manager (≤8 named profiles, stable ids, v2 cfg, legacy migration) | Implemented + host unit tests — pending hardware validation |
 | Touchscreen alphanumeric QWERTY keyboard (name/host) + numeric pad (IPv4/port) | Implemented — pending hardware validation |
 | Profile editor validation, endpoint preview, delete confirmation | Implemented — pending hardware validation |
