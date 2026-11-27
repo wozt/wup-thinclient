@@ -179,15 +179,16 @@ static void test_legacy_migration(void) {
 }
 
 static void test_port_migration(void) {
-    /* stored 50001 (the old shared WUP Stream/ThinServer discovery port)
-       migrates to ThinServer's dedicated 50002; other ports are kept */
+    /* versioned profiles keep explicitly configured ports — including
+       50001, which a user may set on purpose; only the pre-versioned
+       legacy format migrates the old shared default to 50002 */
     profiles_t ps;
     const char *t = "v=2\nP1|Old|192.168.0.1|50001|0|0\n"
                     "P2|Custom|192.168.0.2|50001|0|0\n"
                     "P3|Keep|192.168.0.3|5080|0|0\n";
     CHECK(prof_parse(&ps, t, strlen(t)) == 0);
     CHECK(ps.n == 3);
-    CHECK(ps.p[0].port == 50002 && ps.p[1].port == 50002 && ps.p[2].port == 5080);
+    CHECK(ps.p[0].port == 50001 && ps.p[1].port == 50001 && ps.p[2].port == 5080);
 
     /* legacy format: bare host defaults to 50002, explicit 50001 migrates */
     const char *bare = "192.168.1.50";
@@ -198,12 +199,87 @@ static void test_port_migration(void) {
     CHECK(ps.n == 1 && ps.p[0].port == 50002);
 }
 
+/* Exercises the same commit path the profile editor uses (prof_commit):
+   add-by-empty-id, edit-by-stable-id, delete isolation, and a full
+   serialize/parse persistence cycle with four distinct ports. */
+static void test_editor_workflow(void) {
+    profiles_t ps;
+    prof_init(&ps);
+    static const char *const hosts[] = {
+        "192.168.2.100", "192.168.2.204", "192.168.2.50", "10.0.0.9"
+    };
+    static const int ports[] = { 50002, 50003, 50004, 50005 };
+    prof_t d;
+
+    /* four Adds: each must get a fresh unique id and keep its own data */
+    for (int i = 0; i < 4; i++) {
+        memset(&d, 0, sizeof d);
+        d.type = PROF_TYPE_UDP;
+        snprintf(d.name, sizeof d.name, "Srv%d", i);
+        snprintf(d.host, sizeof d.host, "%s", hosts[i]);
+        d.port = (uint16_t)ports[i];
+        int idx = prof_commit(&ps, &d);
+        CHECK(idx == i && ps.p[i].id == (uint16_t)(i + 1) &&
+              ps.p[i].port == (uint16_t)ports[i]);
+    }
+    CHECK(ps.n == 4 && ps.next_id == 5);
+
+    /* Edit profile id=3 (index 2): only that slot may change, by id —
+       even if the array order shifted underneath */
+    memset(&d, 0, sizeof d);
+    d.id = ps.p[2].id;
+    strcpy(d.name, "Renamed");
+    strcpy(d.host, "192.168.2.99");
+    d.port = 50009;
+    d.type = PROF_TYPE_UDP;
+    CHECK(prof_commit(&ps, &d) == 2);
+    CHECK(!strcmp(ps.p[2].name, "Renamed") && ps.p[2].port == 50009 &&
+          ps.p[2].id == 3);
+    CHECK(ps.p[0].port == 50002 && ps.p[1].port == 50003 &&
+          ps.p[3].port == 50005);           /* neighbours untouched */
+
+    /* commit with an unknown id must fail, not append or corrupt */
+    memset(&d, 0, sizeof d);
+    d.id = 999; strcpy(d.name, "Ghost"); strcpy(d.host, "1.2.3.4"); d.port = 1;
+    CHECK(prof_commit(&ps, &d) == -1 && ps.n == 4);
+
+    /* delete index 0: survivors keep id, name, host, port */
+    CHECK(prof_del(&ps, 0) == 0 && ps.n == 3);
+    CHECK(ps.p[0].id == 2 && ps.p[0].port == 50003);
+    CHECK(ps.p[1].id == 3 && ps.p[1].port == 50009);
+    CHECK(ps.p[2].id == 4 && ps.p[2].port == 50005);
+
+    /* persistence: serialize -> parse -> every profile intact */
+    char buf[3400];
+    int n = prof_serialize(&ps, buf, sizeof buf);
+    CHECK(n > 0);
+    profiles_t q;
+    CHECK(prof_parse(&q, buf, (size_t)n) == 0 && q.n == 3);
+    CHECK(q.p[0].port == 50003 && q.p[1].port == 50009 &&
+          q.p[2].port == 50005);
+    CHECK(q.next_id >= 5);
+
+    /* same IP on different ports and same port on different IPs coexist */
+    prof_init(&ps);
+    memset(&d, 0, sizeof d); d.type = PROF_TYPE_UDP;
+    strcpy(d.name, "A"); strcpy(d.host, "192.168.2.100"); d.port = 50002;
+    CHECK(prof_commit(&ps, &d) == 0);
+    memset(&d, 0, sizeof d); d.type = PROF_TYPE_UDP;
+    strcpy(d.name, "B"); strcpy(d.host, "192.168.2.100"); d.port = 50003;
+    CHECK(prof_commit(&ps, &d) == 1);
+    memset(&d, 0, sizeof d); d.type = PROF_TYPE_UDP;
+    strcpy(d.name, "C"); strcpy(d.host, "192.168.2.204"); d.port = 50002;
+    CHECK(prof_commit(&ps, &d) == 2);
+    CHECK(ps.n == 3);
+}
+
 int main(void) {
     test_validators();
     test_add_del_sel();
     test_serialize_roundtrip();
     test_legacy_migration();
     test_port_migration();
+    test_editor_workflow();
     if (fails) { printf("%d failures\n", fails); return 1; }
     printf("test_profiles: all passed\n");
     return 0;

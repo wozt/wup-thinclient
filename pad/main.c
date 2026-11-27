@@ -89,11 +89,14 @@ static void cfg_load(void) {
     if (profs.disc_port == 50001) profs.disc_port = 50002;
 }
 
-static void cfg_save(void) {
-    if (!wup_fs_ok() || !cfg_dirty) return;
+/* Returns 0 when the config is persisted (or already clean), -1 when the
+   write could not happen — callers that can show UI must surface that. */
+static int cfg_save(void) {
+    if (!wup_fs_ok()) return -1;
+    if (!cfg_dirty) return 0;
     static char buf[3400];
     int n = prof_serialize(&profs, buf, sizeof buf);
-    if (n <= 0) return;
+    if (n <= 0) return -1;
     /* append the LAN discovery port line (kept out of profiles.c: it is a
        property of the discovery action, not of any profile) */
     size_t off = (size_t)n;
@@ -102,7 +105,9 @@ static void cfg_save(void) {
         if (w > 0) off += (size_t)w < sizeof buf - off ? (size_t)w : sizeof buf - off - 1;
         buf[off < sizeof buf ? off : sizeof buf - 1] = 0;
     }
-    if (fs_write(CFG_PATH, buf, (u32)strlen(buf) + 1) >= 0) cfg_dirty = 0;
+    if (fs_write(CFG_PATH, buf, (u32)strlen(buf) + 1) < 0) return -1;
+    cfg_dirty = 0;
+    return 0;
 }
 
 static void cfg_touch(void) { cfg_dirty = 1; }
@@ -153,9 +158,8 @@ static int edit_touch = -1, edit_hover = -1;     /* touch-down key and current k
 static int edit_mode;                            /* 0 = IPv4 host, 1 = UDP port */
 
 /* profile editor (ST_PE) + alphanumeric keyboard (ST_KBD) + delete confirm */
-static prof_t pe_prof;                           /* draft under edit */
+static prof_t pe_prof;                           /* draft under edit (id 0 = new) */
 static char pe_port[8];                          /* port digits while editing */
-static int pe_idx = -1;                          /* profile index, -1 = new */
 static int pe_sel;                               /* focused field/button */
 static int pe_err;                               /* 0 none, 1 name, 2 host, 3 port */
 static char pe_err_msg[72];
@@ -748,7 +752,7 @@ static void menu_activate(int sel) {
         pe_prof.type = PROF_TYPE_UDP;
         pe_port[0] = 0;
         snprintf(pe_port, sizeof pe_port, "50002");
-        pe_idx = -1; pe_sel = 0; pe_err = 0; pe_err_msg[0] = 0;
+        pe_sel = 0; pe_err = 0; pe_err_msg[0] = 0;
         state = ST_PE;
         draw_pe();
         return;
@@ -757,8 +761,7 @@ static void menu_activate(int sel) {
             snprintf(status_msg, sizeof status_msg, "No profile selected");
             draw_menu(); return;
         }
-        pe_prof = profs.p[menu_prof];
-        pe_idx = menu_prof;
+        pe_prof = profs.p[menu_prof];   /* keeps stable id: commit targets it */
         snprintf(pe_port, sizeof pe_port, "%u", (unsigned)pe_prof.port);
         pe_sel = 0; pe_err = 0; pe_err_msg[0] = 0;
         state = ST_PE;
@@ -921,7 +924,8 @@ static void edit_activate(int key) {
         }
         return;
     } else if (key == edit_ndig + EKEY_CANCEL) {
-        edit_leave_pe();
+        if (edit_ret == ST_KBD) { state = ST_KBD; draw_kbd(); }
+        else edit_leave_pe();
         return;
     }
     draw_edit();
@@ -930,7 +934,7 @@ static void edit_activate(int key) {
 /* ---- profile editor (ST_PE) ------------------------------------------------ */
 static void draw_pe(void) {
     wup_screen();
-    draw_brand(30, pe_idx >= 0 ? "Edit connection" : "New connection");
+    draw_brand(30, pe_prof.id ? "Edit connection" : "New connection");
     static const char *const flabels[] = { "Name", "Host", "Port", "Auto-connect" };
     static const char *const fvals[] = { NULL, NULL, NULL, NULL };
     (void)fvals;
@@ -1037,20 +1041,20 @@ static void pe_save(void) {
     }
     pe_prof.port = (uint16_t)prof_port_num(pe_port);
     pe_prof.type = PROF_TYPE_UDP;
-    int idx;
-    if (pe_idx >= 0) {
-        profs.p[pe_idx] = pe_prof;
-        idx = pe_idx;
-    } else {
-        idx = prof_add(&profs, &pe_prof);
-        if (idx < 0) {
-            pe_err = 1; snprintf(pe_err_msg, sizeof pe_err_msg,
-                "Cannot save: list full or invalid data"); draw_pe(); return;
-        }
+    /* commit by stable id (edit) or append (new): never by array index,
+       so a shifted list cannot redirect the write to another profile */
+    int idx = prof_commit(&profs, &pe_prof);
+    if (idx < 0) {
+        pe_err = 1; snprintf(pe_err_msg, sizeof pe_err_msg,
+            "Cannot save: list full or profile gone"); draw_pe(); return;
     }
     profs.sel = idx;
     menu_prof = idx;
-    cfg_touch(); cfg_save();
+    cfg_touch();
+    if (cfg_save() != 0) {
+        pe_err = 1; snprintf(pe_err_msg, sizeof pe_err_msg,
+            "Save failed: storage unavailable"); draw_pe(); return;
+    }
     state = ST_MENU; menu_sel = idx < profs.n ? idx : 0;
     snprintf(status_msg, sizeof status_msg, "Connection saved");
     draw_menu();
@@ -1322,9 +1326,14 @@ static int delconf_hit(int x, int y) {
 
 static void delconf_activate(int sel) {
     if (sel == 0 && del_idx >= 0 && del_idx < profs.n) {
-        prof_del(&profs, del_idx);
+        int del = del_idx;
+        prof_del(&profs, del);   /* shifts profs.sel correctly as an index */
+        /* menu_prof is also an index: apply the same shift or it ends up
+           targeting whichever profile slid into the freed slot */
+        if (menu_prof == del) menu_prof = -1;
+        else if (menu_prof > del) menu_prof--;
+        if (menu_prof >= profs.n) menu_prof = profs.n ? profs.n - 1 : -1;
         if (profs.sel >= profs.n) profs.sel = profs.n - 1;
-        if (menu_prof >= profs.n) menu_prof = profs.n - 1;
         cfg_touch(); cfg_save();
         state = ST_MENU; menu_sel = 0;
         snprintf(status_msg, sizeof status_msg, "Connection deleted");
@@ -1686,7 +1695,12 @@ int main(void) {
                 int key = edit_touch, activate = edit_hover == edit_touch;
                 edit_touch = edit_hover = -1;
                 if (activate) edit_activate(key); else draw_edit();
-            } else if (pressed & WUP_B) { state = ST_PE; draw_pe(); }
+            } else if (pressed & WUP_B) {
+                /* return to whoever opened the pad: the profile editor, or
+                   the alphanumeric keyboard when editing the host field */
+                if (edit_ret == ST_KBD) { state = ST_KBD; draw_kbd(); }
+                else { state = ST_PE; draw_pe(); }
+            }
             else if (pressed & WUP_LEFT || pressed & WUP_RIGHT) {
                 int d = (pressed & WUP_RIGHT) ? 1 : -1;
                 if (edit_sel >= edit_ndig) {           /* action column: vertical */

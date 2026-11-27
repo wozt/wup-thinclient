@@ -48,6 +48,9 @@ char *prof_endpoint(const prof_t *p, char *buf, size_t size);
 int prof_find_id(const profiles_t *ps, uint16_t id);   /* index or -1 */
 int prof_add(profiles_t *ps, const prof_t *src);       /* index or -1 */
 int prof_del(profiles_t *ps, int idx);                 /* 0 ok, -1 bad index */
+/* Editor commit: draft->id == 0 adds (fresh unique id), nonzero id
+   replaces that profile by stable id. Returns index or -1. */
+int prof_commit(profiles_t *ps, const prof_t *draft);
 
 /* Versioned text format:
      v=2

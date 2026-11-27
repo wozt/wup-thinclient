@@ -138,6 +138,25 @@ int prof_del(profiles_t *ps, int idx) {
     return 0;
 }
 
+/* Commit an editor draft. draft->id == 0 appends a new profile (fresh
+   unique id); a nonzero id replaces the profile carrying that stable id,
+   preserving its slot. Returns the profile index or -1. Editing by id —
+   never by array position — keeps the intended profile immune to list
+   shifts (insert/delete of neighbours). */
+int prof_commit(profiles_t *ps, const prof_t *draft) {
+    if (!draft) return -1;
+    if (!draft->id) return prof_add(ps, draft);
+    int idx = prof_find_id(ps, draft->id);
+    if (idx < 0) return -1;
+    if (!prof_name_valid(draft->name) ||
+        !prof_endpoint_valid(draft->host, draft->port))
+        return -1;
+    uint16_t id = ps->p[idx].id;
+    ps->p[idx] = *draft;
+    ps->p[idx].id = id;              /* id is identity: never taken from draft */
+    return idx;
+}
+
 /* ---- text format ------------------------------------------------------- */
 
 static void put_str(char *buf, size_t size, size_t *off, const char *s) {
@@ -289,7 +308,6 @@ int prof_parse(profiles_t *ps, const char *buf, size_t len) {
                     memcpy(np.name, name, strlen(name) + 1);
                     memcpy(np.host, host, strlen(host) + 1);
                     np.port = (uint16_t)prof_port_num(portb);
-                    if (np.port == 50001) np.port = 50002;   /* old shared default -> ThinServer port */
                     np.type = (uint8_t)type;
                     np.auto_connect = (uint8_t)au;
                     prof_add(ps, &np);
