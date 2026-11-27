@@ -44,6 +44,8 @@ test:
 	@build/tests/test_ip_editor
 	@cc -std=c11 -Wall -Wextra -Werror -Ipad pad/home_keys.c tests/test_home_keys.c -o build/tests/test_home_keys
 	@build/tests/test_home_keys
+	@cc -std=c11 -Wall -Wextra -Werror -Ipad pad/profiles.c tests/test_profiles.c -o build/tests/test_profiles
+	@build/tests/test_profiles
 	@python3 -m unittest discover -s tests -v
 
 clean:
