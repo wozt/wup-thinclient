@@ -8,9 +8,11 @@ configuration (desktop, quality, input map) lives in WUP ThinServer's
 
 | Setting | Where | Default |
 |---|---|---|
-| Server address | Menu → **Edit server address** (touchscreen numeric keypad) | empty = "any server" (first `H` wins) |
-| Any-server mode | Menu → **Use any server** | Explicitly clears the fixed address |
-| Auto-connect | Menu → **Auto-connect** toggle | **off** |
+| Connection profiles | Menu → **Add** / **Edit** / **Delete** (up to 8) | none on fresh install |
+| Selected profile | tap a row in the profile list | last used, persisted |
+| Connect | Menu → **Connect** on the selected profile | manual only |
+| Auto-connect | Menu → **Auto: on/off** (per selected profile) | **off** |
+| LAN discovery | Menu → **LAN discovery** (broadcast `B`) | manual only |
 | Persisted file | `/save/thinclient.cfg` on GamePad flash | — |
 | Emergency quit | **HOME + B** ~2 s (any state) | — |
 | Local shortcuts | **HOME** held 5 s | in-stream menu (Resume/Disconnect/Reconnect/Controls/Exit) |
@@ -18,19 +20,59 @@ configuration (desktop, quality, input map) lives in WUP ThinServer's
 | Local shortcuts | **HOME + D-pad Up/Down** | physical backlight brighter/dimmer (hardware levels) |
 | Remote HOME | **HOME** short tap | forwarded to ThinServer — bindable like any button |
 
-`thinclient.cfg` format (one line, whitespace-separated tokens):
-`<host-or-any> port=<1-65535> auto=<0|1>`, e.g.
-`192.168.1.10 port=50001 auto=0`, `thinserver.home.lan port=5080 auto=1`
-or `any auto=1`. `<host>` is a DNS name or dotted IPv4; `any` selects LAN
-broadcast discovery. `port` defaults to 50001. Files written by older
-builds (bare IP + `auto=`) still load unchanged.
+### Connection profiles
 
-Direct endpoints: when a host is configured the client unicasts `B`
-beacons to `host:port` (resolved once per attempt via lwIP DNS) instead
-of broadcasting, and only that server address may answer. The server
-replies from its observed source endpoint, so no inbound port forwarding
-is needed on the GamePad's network (cone-type NAT; symmetric NAT is not
-supported). DNS failures and timeouts show as menu status messages.
+Each profile stores a display **name**, a **host** (DNS name or dotted
+IPv4 — IPv6 is not supported), a **UDP port** (1–65535, default 50001),
+a connection **type** (only UDP today) and an **auto-connect** flag.
+Names allow letters, digits, space, `.`, `-`, `_` (max 31 chars); hosts
+follow DNS label rules (max 253 chars, labels 1–63, no leading/trailing
+hyphen, `[A-Za-z0-9.-]` only — no URL parts, credentials or paths).
+
+The profile editor has four fields — Name and Host open a QWERTY
+touchscreen keyboard (shift, backspace, clear, save, cancel; the Host
+keyboard also offers an **IP** key that switches to the numeric IPv4
+pad), Port opens the numeric pad. Saving validates every field and never
+starts a connection; Cancel discards the draft. Deleting asks for
+confirmation. Selecting a row never connects — only **Connect** does,
+except the selected startup profile flagged auto-connect (or the
+migrated LAN-discovery auto flag).
+
+### `thinclient.cfg` format (version 2)
+
+```
+v=2
+sel=<profile-id|-1>
+disc=<0|1>
+dport=<1-65535>
+P<id>|<name>|<host>|<port>|<type>|<auto>
+```
+
+`sel` stores the stable profile **id** (not the row index), so renaming,
+reordering or deleting other profiles cannot silently retarget it.
+`disc`/`dport` are the LAN-discovery auto-connect flag and broadcast
+port. Writes happen only when the configuration actually changes
+(selection included); there is no atomic rename in the libwup fs API, so
+a mid-write power loss can corrupt the file — the parser then falls back
+to defaults rather than truncating hostnames.
+
+**Migration:** legacy single-line files
+(`<host-or-any> port=<n> auto=<0|1>`, including bare IPv4) are converted
+on first load into one profile that keeps the host, port and auto flag;
+`any auto=1` becomes discovery auto-connect with no profiles. Legacy
+hosts were capped at 47 chars, so migrated names/hosts never needed
+truncation.
+
+Direct endpoints: with a profile selected the client unicasts `B`
+beacons to `host:port` (resolved via lwIP DNS at each connect attempt —
+numeric IPv4 skips DNS entirely) instead of broadcasting, and only the
+resolved address may answer. The server replies from its observed source
+endpoint, so no inbound port forwarding is needed on the GamePad's
+network (cone-type NAT; symmetric NAT is not supported). DNS resolution
+is blocking inside lwIP's own timeouts: the connecting screen stays up
+with "Looking for host:port ..." meanwhile, and a failure returns to the
+profile list with "Cannot resolve ..." — it never enters the connecting
+state.
 
 ## Connection behavior
 

@@ -21,10 +21,10 @@ the SHA256 checksum.
 1. On the GamePad, browse the NetFS share and start `wup_thinclient.wup`
    from the Homebrew Menu.
 2. Make sure the WUP ThinServer is running on the same network.
-3. The **connection menu** appears — nothing streams yet. Choose
-   **Edit server address** to type the server IP (or leave "any
-   server"), then **Connect**. Config persists on the GamePad flash
-   (`/save/thinclient.cfg`, including the auto-connect flag).
+3. The **connection menu** appears — nothing streams yet. Tap **Add** to
+   create a profile (name, host or IPv4, UDP port), or **LAN discovery**
+   to find a server on the local network, then **Connect**. Profiles and
+   the selection persist on the GamePad flash (`/save/thinclient.cfg`).
 
 ## Emergency exit
 

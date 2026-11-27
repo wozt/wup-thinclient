@@ -32,15 +32,18 @@ Derived from `wup-stream/pad/main.c` @ `e1b0430`. Unchanged core:
 
 Added for ThinClient:
 
-- `cfg_load`/`cfg_save`: server IP + auto-connect flag persisted at
-  `/save/thinclient.cfg` (littlefs flash via libwup `fs_*`).
-- Connection state machine (`ST_MENU`/`ST_EDIT`/`ST_CONNECTING`/
-  `ST_STREAMING`/`ST_INGAME`): beacons and `H` acceptance only happen in
-  `ST_CONNECTING`; the menu never broadcasts readiness. The configured IP
-  is a selection filter (plus `conn_target` pinning for reconnects), not
-  authentication.
-- Local UI: connection menu (Connect / Edit / Use any server / Auto-connect /
-  Exit, touch + d-pad), touchscreen numeric IPv4 keypad, and an in-stream
+- `pad/profiles.c`: saved connection profiles (pure logic, host-tested) —
+  up to 8 named endpoints (name, DNS host or IPv4, UDP port, type,
+  auto-connect flag, stable ids), versioned `v=2` text format in
+  `/save/thinclient.cfg` with legacy single-endpoint migration.
+- Connection state machine (`ST_MENU` profile list / `ST_PE` editor /
+  `ST_EDIT` numeric pad / `ST_KBD` alphanumeric keyboard / `ST_DELCONF` /
+  `ST_CONNECTING`/`ST_STREAMING`/`ST_INGAME`): beacons and `H` acceptance
+  only happen in `ST_CONNECTING`; browsing and editing never touch the
+  network. The resolved IP is a selection filter, not authentication.
+- Local UI: profile list (select / Connect / Add / Edit / Delete / LAN
+  discovery / Auto / Exit, touch + d-pad), QWERTY touchscreen keyboard for
+  names and hostnames, numeric pad for IPv4 and ports, and an in-stream
   menu reached by a 5 s HOME hold that pauses the decoder and sends a
   neutral input report (all remote inputs released) until Resume.
 - HOME shortcuts (`pad/home_keys.c`, pure logic + host unit tests): short

@@ -3,11 +3,12 @@
 | Feature | Status |
 |---|---|
 | GamePad homebrew (adapted pad client) | Implemented |
-| Connection state machine + menu (Connect/Edit/Auto-connect/Exit) | Implemented — pending hardware retest |
-| Explicit-connect flow: no streaming until Connect; no beacons while disconnected | Implemented — pending hardware retest |
-| Touchscreen IPv4 keypad (validation, Save/Cancel, pressed feedback) | Implemented — pending hardware validation |
-| Explicit any-server menu action + persistence | Implemented — pending hardware validation |
-| Auto-connect option (off by default) + auto-reconnect on loss | Implemented — pending hardware retest |
+| Connection profile manager (≤8 named profiles, stable ids, v2 cfg, legacy migration) | Implemented + host unit tests — pending hardware validation |
+| Touchscreen alphanumeric QWERTY keyboard (name/host) + numeric pad (IPv4/port) | Implemented — pending hardware validation |
+| Profile editor validation, endpoint preview, delete confirmation | Implemented — pending hardware validation |
+| Direct UDP endpoint (unicast `B` to `host:port`, DNS via lwIP, custom port) | Implemented — LAN-verified, pending hardware retest |
+| LAN discovery (explicit broadcast action, `disc`/`dport` persisted) | Implemented — pending hardware retest |
+| Auto-connect per profile + auto-reconnect on loss (DNS re-resolved each attempt) | Implemented — pending hardware retest |
 | In-stream menu via 5 s HOME hold (Resume/Disconnect/Reconnect/Controls/Exit) | Implemented — pending hardware retest |
 | Remote-input release while local menu open (neutral report) | Implemented — pending hardware retest |
 | HOME shortcut state machine (short tap forwarded, 5 s menu, HOME+X mode switch, HOME+Up/Down backlight, HOME+B exit, no leakage) | Implemented + host unit tests — pending hardware retest |
@@ -18,12 +19,14 @@
 | Pinned libwup SDK via git submodule + `LIBWUP_DIR` override | Tested automatically |
 | `.wup` artifact at `build/apps/wup_thinclient.wup` | Tested automatically |
 | NetFS deploy to `~/wup-share` with SHA256 verify | Tested automatically |
-| Host-side unit tests (config format, app.cfg, IPv4 editor, HOME shortcut state machine) | Tested automatically |
+| Host-side unit tests (config format, app.cfg, IPv4 editor, HOME shortcut state machine, profiles) | Tested automatically |
 | **Core streaming on physical GamePad (WUP-010)** | **Validated — developer-reported** (all 13 baseline checks passed) |
 | HOME shortcuts / mode switching / remote HOME on hardware | Pending physical retest |
+| Profile manager / keyboards / direct connect on hardware | Pending physical retest |
 | 60 fps sustained | Not measured |
 
-Last updated: settings layout + direct connections milestone (unicast 'B'
-to host:port, DNS resolution, custom listen port, observed source-port
-replies). Pending: saved connection profiles UI + alphanumeric keyboard,
-physical retest of HOME shortcuts.
+Last updated: connection profile manager milestone (versioned profiles,
+alphanumeric keyboard, DNS re-resolution on reconnect, corrected
+auto-connect error path). Pending: physical retest, isolated-NAT
+direct-connection validation, secure WAN transport feasibility, PC
+reference client.

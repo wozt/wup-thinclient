@@ -17,9 +17,11 @@ environment. An uncommitted local SDK can be substituted via
 - `pad/main.c` — adapted from `wup-stream/pad/main.c` @ `e1b0430`
   (~470 → ~610 lines). Unchanged core: UDP/`B` beacon, `H`/`V`/`A`/`R`/`Q`,
   `I`/`N`/`M`, HW H.264 decode, PCM audio, NACK, watchdog, diag thread.
-  Local additions: `cfg_load`/`cfg_save` (`/save/thinclient.cfg`),
-  `ip_matches`, local server-selection UI (`UI_*`, `draw_ui_*`),
-  `autostart_stream`, ThinClient branding.
+  Local additions: `pad/profiles.c` + `cfg_load`/`cfg_save`
+  (`/save/thinclient.cfg`, versioned profiles with legacy migration),
+  `ip_matches`, local connection UI (profile list, profile editor,
+  alphanumeric keyboard, numeric pad, in-stream menu), `begin_connect`,
+  ThinClient branding.
 - `pad/app.cfg` — `name = WUP ThinClient`, own description/icon; build
   defines identical to upstream pad (net buffers, decoder config).
 - `pad/icon.png` — new ThinClient icon.

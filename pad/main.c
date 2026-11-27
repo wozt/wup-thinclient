@@ -33,8 +33,9 @@
 #include "wup.h"
 #include "armcpu.h"
 #include "wup_hw.h"                                   /* (hw_backlight_percent: the table's levels) */
-#include "fs.h"                                       /* saved server configuration */
+#include "fs.h"                                       /* saved connection profiles */
 #include "ip_editor.h"
+#include "profiles.h"                                /* saved connection profiles */
 #include "home_keys.h"                               /* HOME shortcut state machine */
 
 WUP_APP("WUP ThinClient");
@@ -47,60 +48,61 @@ typedef uint8_t u8; typedef uint16_t u16; typedef uint32_t u32;
 static u32 ms_, last_clk, frac;
 static u32 clock_ms(void) { u32 c = CLOCK; frac += c - last_clk; last_clk = c; ms_ += frac / 997; frac %= 997; return ms_; }
 
-/* ---- local configuration: the WUP ThinServer endpoint ----------------------
-   server_host is a DNS name or dotted quad; "" = LAN broadcast discovery.
-   server_port is the UDP port the server listens on for 'B' beacons
-   (default 50001). Direct endpoints are reached by unicast 'B' beacons;
-   the server answers from its observed source endpoint, so no inbound
-   port forwarding is needed on the GamePad's network (cone NAT). */
+/* ---- saved connection profiles ---------------------------------------------
+   /save/thinclient.cfg holds a versioned profile list (profiles.c): up to
+   PROF_MAX named endpoints, each a DNS name or dotted quad plus a UDP port.
+   Legacy single-endpoint files are migrated on first load. The active
+   endpoint globals below are only set while a connection is attempted;
+   browsing and editing never touch the network. */
 #define CFG_PATH "/save/thinclient.cfg"
-#define SERVER_HOST_MAX 48
-static char server_host[SERVER_HOST_MAX];
+static profiles_t profs;
+static int cfg_dirty;
+
+/* active endpoint (set when Connect / auto-connect / reconnect fires) */
+static char server_host[PROF_HOST_MAX];
 static int server_port = 50001;
 static u32 server_addr;             /* resolved IPv4 for direct mode, 0 = none */
-static int auto_connect;            /* connect on start and after a lost stream */
+static int auto_connect;            /* auto-reconnect after a lost stream */
 
 static void cfg_load(void) {
+    prof_init(&profs);
+    cfg_dirty = 0;
     server_host[0] = 0;
     server_port = 50001;
     auto_connect = 0;
     server_addr = 0;
     if (!wup_fs_ok()) return;
-    char buf[160];
+    static char buf[3400];
     memset(buf, 0, sizeof buf);
     int n = fs_read(CFG_PATH, 0, buf, (u32)sizeof buf - 1);
     if (n <= 0) return;
     buf[sizeof buf - 1] = 0;
-    /* whitespace-separated tokens: a bare token is the host ("any" = LAN
-       discovery, backward compatible with the old bare-IP format);
-       port=N and auto=N are key=value tokens */
-    char *save = NULL;
-    for (char *tok = strtok_r(buf, " \t\r\n", &save); tok;
-         tok = strtok_r(NULL, " \t\r\n", &save)) {
-        if (!strncmp(tok, "port=", 5)) {
-            int p = atoi(tok + 5);
-            if (p >= 1 && p <= 65535) server_port = p;
-        } else if (!strncmp(tok, "auto=", 5)) {
-            if (tok[5] == '1') auto_connect = 1;
-        } else if (!strchr(tok, '=')) {
-            if (!strcmp(tok, "any")) server_host[0] = 0;
-            else {
-                size_t l = strlen(tok);
-                if (l >= sizeof server_host) l = sizeof server_host - 1;
-                memcpy(server_host, tok, l);
-                server_host[l] = 0;
-            }
-        }
+    prof_parse(&profs, buf, (size_t)n);
+    /* a migrated or stored discovery port, if present */
+    char *dp = strstr(buf, "\ndport=");
+    if (dp) {
+        int v = atoi(dp + 7);                  /* skip '\n' + "dport=" */
+        if (v >= 1 && v <= 65535) profs.disc_port = v;
     }
 }
 
 static void cfg_save(void) {
-    if (!wup_fs_ok()) return;
-    char buf[96];
-    snprintf(buf, sizeof buf, "%s port=%d auto=%d",
-             server_host[0] ? server_host : "any", server_port, auto_connect);
-    fs_write(CFG_PATH, buf, (u32)strlen(buf) + 1);
+    if (!wup_fs_ok() || !cfg_dirty) return;
+    static char buf[3400];
+    int n = prof_serialize(&profs, buf, sizeof buf);
+    if (n <= 0) return;
+    /* append the LAN discovery port line (kept out of profiles.c: it is a
+       property of the discovery action, not of any profile) */
+    size_t off = (size_t)n;
+    if (off + 24 < sizeof buf) {
+        int w = snprintf(buf + off, sizeof buf - off, "dport=%d\n", profs.disc_port);
+        if (w > 0) off += (size_t)w < sizeof buf - off ? (size_t)w : sizeof buf - off - 1;
+        buf[off < sizeof buf ? off : sizeof buf - 1] = 0;
+    }
+    if (fs_write(CFG_PATH, buf, (u32)strlen(buf) + 1) >= 0) cfg_dirty = 0;
 }
+
+static void cfg_touch(void) { cfg_dirty = 1; }
 
 /* Resolve the configured endpoint once per connect attempt. Numeric IPv4
    literals resolve locally; names go through lwIP DNS (blocking, bounded
@@ -130,18 +132,39 @@ static int ip_matches(const struct sockaddr_in *from) {
 }
 
 /* ---- local UI state --------------------------------------------------------- */
-enum { ST_MENU, ST_EDIT, ST_CONNECTING, ST_STREAMING, ST_INGAME };
+enum { ST_MENU, ST_PE, ST_EDIT, ST_KBD, ST_DELCONF,
+       ST_CONNECTING, ST_STREAMING, ST_INGAME };
 static int state = ST_MENU;
 static int menu_sel;                             /* menu row / ingame row */
+static int menu_prof = -1;                       /* profile the menu actions act on */
 static int ingame_sub;                           /* 0 = actions, 1 = controls help */
 static char status_msg[80];                      /* menu status line */
 static u32 conn_deadline;                        /* connect attempt timeout */
 static int next_state = ST_MENU;                 /* where end_session() lands */
 static u32 last_peer_ip;                         /* last server that streamed */
 static int quit_app;                             /* menu Exit / emergency quit */
-static char edit_ip[SERVER_HOST_MAX];            /* keypad edit buffer, never heap-allocated */
+static int pending_resolve;                      /* re-resolve endpoint on next loop */
+static char edit_ip[PROF_HOST_MAX];             /* numeric keypad buffer (IPv4/port) */
 static int edit_sel;                             /* optional D-pad keypad selection */
 static int edit_touch = -1, edit_hover = -1;     /* touch-down key and current key */
+static int edit_mode;                            /* 0 = IPv4 host, 1 = UDP port */
+
+/* profile editor (ST_PE) + alphanumeric keyboard (ST_KBD) + delete confirm */
+static prof_t pe_prof;                           /* draft under edit */
+static char pe_port[8];                          /* port digits while editing */
+static int pe_idx = -1;                          /* profile index, -1 = new */
+static int pe_sel;                               /* focused field/button */
+static int pe_err;                               /* 0 none, 1 name, 2 host, 3 port */
+static char pe_err_msg[72];
+static int del_idx = -1;                         /* profile pending delete confirm */
+static char kbd_buf[PROF_HOST_MAX];              /* keyboard edit buffer */
+static int kbd_len, kbd_target;                  /* 0 name, 1 host */
+
+static void draw_pe(void);
+static void draw_kbd(void);
+static void draw_delconf(void);
+static void kbd_open(void);
+static void pe_save(void);
 
 /* ---- HOME shortcuts + live input-mode switching ('T' packets) -------------- */
 static home_keys_t hk;
@@ -450,7 +473,6 @@ static void draw_brand(int y, const char *sub) {
 
 /* ---- menu geometry (shared by drawing and touch hit-testing) ----------------- */
 static void draw_edit(void);
-static void edit_from_saved(void);
 #define MI_MAX 8
 static int mi_y[MI_MAX], mi_h[MI_MAX], mi_n;
 
@@ -467,38 +489,150 @@ static void menu_item(int i, int y, int h, const char *label, int sel) {
 }
 
 static void draw_server_line(void) {
-    char line[64];
-    if (server_host[0]) snprintf(line, sizeof line, "Server: %s:%d", server_host, server_port);
-    else snprintf(line, sizeof line, "Server: any (first found)");
+    char line[96];
+    if (server_host[0]) {
+        size_t l = strlen(server_host);
+        const char *h = server_host;
+        if (l > 60) { h = server_host + l - 60; }   /* keep the tail: port stays visible */
+        snprintf(line, sizeof line, "Server: %s:%d", h, server_port);
+    } else {
+        snprintf(line, sizeof line, "Server: any (first found)");
+    }
     gfx_text_c(&font_body, GFX_W / 2, 168, line, RGB(255, 255, 255));
+}
+
+/* ---- profile list geometry -------------------------------------------------
+   Rows: up to PROF_MAX profiles, then 7 action buttons in two rows.
+   Item indices: 0..n-1 profiles, then ACT_* offsets. */
+enum { ACT_CONNECT, ACT_ADD, ACT_EDIT, ACT_DEL, ACT_LAN, ACT_AUTO, ACT_EXIT, ACT_COUNT };
+#define PROF_ROW_Y 162
+#define PROF_ROW_H 27
+static int pm_y[PROF_MAX + ACT_COUNT], pm_h[PROF_MAX + ACT_COUNT], pm_n;
+static int pm_is_act[PROF_MAX + ACT_COUNT];
+
+static void pm_item(int i, int y, int h, int is_act) {
+    pm_y[i] = y; pm_h[i] = h; pm_is_act[i] = is_act;
+}
+
+static void draw_profile_row(int i, int sel, int cur) {
+    const prof_t *p = &profs.p[i];
+    int y = PROF_ROW_Y + i * PROF_ROW_H;
+    if (sel) {
+        gfx_rrect(20, y, GFX_W - 40, PROF_ROW_H - 3, 6, RGB(46, 96, 168), 220);
+        gfx_rrect_outline(20, y, GFX_W - 40, PROF_ROW_H - 3, 6, 1, RGB(120, 190, 255));
+    } else if (cur) {
+        gfx_rrect(20, y, GFX_W - 40, PROF_ROW_H - 3, 6, RGB(30, 42, 66), 200);
+    }
+    gfx_text(&font_body, 36, y + 20, p->name,
+             sel ? RGB(255, 255, 255) : RGB(215, 225, 245));
+    /* endpoint right-aligned; keep the tail so ":port" is always visible */
+    char ep[72];
+    char full[PROF_HOST_MAX + 8];
+    snprintf(full, sizeof full, "%s:%u", p->host, (unsigned)p->port);
+    size_t fl = strlen(full);
+    if (fl >= sizeof ep) {
+        memcpy(ep, full + fl - sizeof ep + 1, sizeof ep - 1);
+        ep[0] = '<'; ep[sizeof ep - 1] = 0;
+    } else strcpy(ep, full);
+    int w = gfx_text_w(&font_small, ep);
+    gfx_text(&font_small, GFX_W - 36 - w, y + 20, ep,
+             sel ? RGB(190, 220, 255) : RGB(140, 155, 190));
+    if (p->auto_connect)
+        gfx_text(&font_small, GFX_W - 36 - w - 46, y + 20, "AUTO",
+                 RGB(255, 210, 120));
+}
+
+static void draw_act_button(int x, int y, int w, int h, const char *label,
+                            int sel, int enabled) {
+    px_t fill = !enabled ? RGB(24, 28, 38) : sel ? RGB(46, 96, 168) : RGB(24, 38, 62);
+    px_t text = !enabled ? RGB(95, 105, 125) : RGB(240, 246, 255);
+    gfx_rrect(x, y, w, h, 8, fill, 230);
+    if (sel && enabled)
+        gfx_rrect_outline(x, y, w, h, 8, 2, RGB(130, 205, 255));
+    gfx_text_c(&font_body, x + w / 2, y + h / 2 + 7, label, text);
 }
 
 static void draw_menu(void) {
     wup_screen();
-    draw_brand(84, "Linux desktop on the GamePad");
-    draw_server_line();
-    gfx_text_c(&font_small, GFX_W / 2, 196, wup_net_ip_str(), RGB(140, 155, 190));
+    draw_brand(46, "Linux desktop on the GamePad");
+    gfx_text_c(&font_small, GFX_W / 2, 104, wup_net_ip_str(), RGB(140, 155, 190));
     if (status_msg[0])
-        gfx_text_c(&font_body, GFX_W / 2, 232, status_msg, RGB(255, 210, 120));
-    char any[48], ac[40];
-    snprintf(any, sizeof any, "Use any server%s", server_host[0] ? "" : " (selected)");
-    snprintf(ac, sizeof ac, "Auto-connect: %s", auto_connect ? "on" : "off");
-    const char *labels[] = { "Connect", "Edit server address", any, ac, "Exit" };
-    mi_n = 0;
-    for (int i = 0; i < 5; i++)
-        menu_item(mi_n++, 246 + i * 40, 34, labels[i], menu_sel == i);
-    gfx_text_c(&font_small, GFX_W / 2, 480 - 18,
-               "D-pad + A   touch   B: quit   HOME+B: quit   hold HOME 5 s: menu", RGB(120, 135, 170));
+        gfx_text_c(&font_body, GFX_W / 2, 124, status_msg, RGB(255, 210, 120));
+    gfx_text_c(&font_small, GFX_W / 2, 144, "Connections", RGB(150, 170, 205));
+
+    pm_n = 0;
+    for (int i = 0; i < profs.n && i < PROF_MAX; i++) {
+        pm_item(pm_n, PROF_ROW_Y + i * PROF_ROW_H, PROF_ROW_H, 0);
+        pm_n++;
+    }
+    if (!profs.n) {
+        gfx_text_c(&font_body, GFX_W / 2, 250,
+                   "No saved connections", RGB(190, 205, 230));
+        gfx_text_c(&font_small, GFX_W / 2, 278,
+                   "Add one below, or use LAN discovery", RGB(140, 155, 190));
+    } else {
+        for (int i = 0; i < profs.n && i < PROF_MAX; i++)
+            draw_profile_row(i, menu_sel == i, menu_prof == i && menu_sel >= profs.n);
+    }
+    /* action rows */
+    static const char *const a1[] = { "Connect", "Add", "Edit", "Delete" };
+    static const char *const a2[] = { "LAN discovery", NULL, "Exit" };   /* [1] = Auto (dynamic) */
+    int ay1 = 388, ay2 = 424;
+    for (int i = 0; i < ACT_COUNT; i++) {
+        int row = i < 4 ? 0 : 1;
+        int col = i < 4 ? i : i - 4;
+        int ncol = i < 4 ? 4 : 3;
+        int w = (GFX_W - 40 - (ncol - 1) * 10) / ncol;
+        int x = 20 + col * (w + 10);
+        int y = row ? ay2 : ay1;
+        pm_item(pm_n, y, 32, 1); pm_n++;
+        const char *label = row ? a2[col] : a1[col];
+        char auto_lbl[24];
+        int enabled = 1;
+        if (row && col == 1) {                            /* Auto-connect toggle */
+            int on = menu_prof >= 0 && menu_prof < profs.n
+                         ? profs.p[menu_prof].auto_connect : profs.disc_auto;
+            snprintf(auto_lbl, sizeof auto_lbl, "Auto: %s", on ? "on" : "off");
+            label = auto_lbl;
+            enabled = menu_prof >= 0 || profs.n == 0;
+        } else if (!row) {
+            /* Connect/Add always live; Edit/Delete need a profile; Connect
+               additionally needs at least one saved profile */
+            enabled = col <= 1 ? 1 : menu_prof >= 0 && menu_prof < profs.n;
+            if (col == 0 && profs.n == 0) enabled = 0;
+        }
+        draw_act_button(x, y, w, 32, label, menu_sel == pm_n - 1, enabled);
+    }
+    gfx_text_c(&font_small, GFX_W / 2, 474,
+               "D-pad + A   touch   B: quit   HOME+B: quit   hold HOME 5 s: menu",
+               RGB(120, 135, 170));
     gfx_present_all();
+}
+
+/* hit test for the profile list: returns item index or -1 */
+static int prof_hit(int x, int y) {
+    for (int i = 0; i < pm_n; i++)
+        if (y >= pm_y[i] && y < pm_y[i] + pm_h[i]) {
+            if (pm_is_act[i]) {
+                /* recompute the button rect the same way draw_menu did */
+                int ai = i - profs.n;
+                int row = ai < 4 ? 0 : 1, col = ai < 4 ? ai : ai - 4;
+                int ncol = row ? 3 : 4;
+                int w = (GFX_W - 40 - (ncol - 1) * 10) / ncol;
+                int bx = 20 + col * (w + 10);
+                if (x >= bx && x < bx + w) return i;
+            } else if (x >= 20 && x <= GFX_W - 20) {
+                return i;
+            }
+        }
+    return -1;
 }
 
 static void draw_connecting(void) {
     wup_screen();
     draw_brand(170, NULL);
-    char line[64];
-    if (conn_target)
-        snprintf(line, sizeof line, "Reconnecting to %s ...", inet_ntoa((struct in_addr){ conn_target }));
-    else if (server_host[0])
+    char line[96];
+    if (server_host[0])
         snprintf(line, sizeof line, "Looking for %s:%d ...", server_host, server_port);
     else
         snprintf(line, sizeof line, "Looking for any WUP ThinServer ...");
@@ -550,138 +684,649 @@ static void draw_ingame(void) {
     gfx_present_all();
 }
 
-static void start_connecting(u32 target, const char *msg) {
-    conn_target = target;
-    conn_deadline = clock_ms() + 15000;
+/* Begin a connection attempt against the endpoint already copied into
+   server_host/server_port ("" host = LAN discovery on profs.disc_port).
+   DNS resolution runs while the connecting screen is up; a failure returns
+   to the profile list with an error instead of entering ST_CONNECTING. */
+static void begin_connect(void) {
     state = ST_CONNECTING;
-    snprintf(status_msg, sizeof status_msg, "%s", msg ? msg : "");
+    conn_target = 0;
+    server_addr = 0;
+    conn_deadline = clock_ms() + 30000;   /* covers DNS + beacon window */
+    snprintf(status_msg, sizeof status_msg, "press B to cancel");
     draw_connecting();
+    if (!resolve_server()) {
+        state = ST_MENU;
+        snprintf(status_msg, sizeof status_msg, "Cannot resolve %s", server_host);
+        draw_menu();
+        return;
+    }
+    conn_deadline = clock_ms() + 15000;
+}
+
+static void use_profile_endpoint(int idx) {
+    const prof_t *p = &profs.p[idx];
+    snprintf(server_host, sizeof server_host, "%s", p->host);
+    server_port = p->port;
+    auto_connect = p->auto_connect;
 }
 
 static void menu_activate(int sel) {
-    switch (sel) {
-    case 0:  /* Connect */
-        if (!net_ok) { snprintf(status_msg, sizeof status_msg, "No Wi-Fi connection"); draw_menu(); return; }
-        if (!resolve_server()) {
-            snprintf(status_msg, sizeof status_msg, "Cannot resolve %s", server_host);
-            draw_menu(); return;
-        }
-        conn_target = server_addr;
-        start_connecting(conn_target, "press B to cancel");
-        return;
-    case 1:  /* Edit server address */
-        edit_from_saved();
-        state = ST_EDIT;
-        draw_edit();
-        return;
-    case 2:  /* Explicit any-server selection */
-        server_host[0] = 0;
-        server_addr = 0;
-        cfg_save();
-        snprintf(status_msg, sizeof status_msg, "Any-server mode selected");
+    if (sel < profs.n) {                     /* profile row: select only */
+        menu_prof = sel;
+        if (profs.sel != sel) { profs.sel = sel; cfg_touch(); }
         draw_menu();
         return;
-    case 3:  /* Auto-connect toggle */
-        auto_connect = !auto_connect;
+    }
+    int act = sel - profs.n;                 /* ACT_* */
+    if (act < 0 || act >= ACT_COUNT) return;
+    /* actions that need a profile resolve menu_prof first */
+    if ((act == ACT_CONNECT || act == ACT_EDIT || act == ACT_DEL || act == ACT_AUTO) &&
+        (menu_prof < 0 || menu_prof >= profs.n)) {
+        menu_prof = profs.sel >= 0 && profs.sel < profs.n ? profs.sel
+                                                         : (profs.n ? 0 : -1);
+    }
+    switch (act) {
+    case ACT_CONNECT:
+        if (menu_prof < 0 || menu_prof >= profs.n) {
+            snprintf(status_msg, sizeof status_msg, "No profile selected");
+            draw_menu(); return;
+        }
+        if (!net_ok) { snprintf(status_msg, sizeof status_msg, "No Wi-Fi connection"); draw_menu(); return; }
+        profs.sel = menu_prof; cfg_touch();
+        use_profile_endpoint(menu_prof);
+        begin_connect();
+        return;
+    case ACT_ADD:
+        memset(&pe_prof, 0, sizeof pe_prof);
+        pe_prof.type = PROF_TYPE_UDP;
+        pe_port[0] = 0;
+        snprintf(pe_port, sizeof pe_port, "50001");
+        pe_idx = -1; pe_sel = 0; pe_err = 0; pe_err_msg[0] = 0;
+        state = ST_PE;
+        draw_pe();
+        return;
+    case ACT_EDIT:
+        if (menu_prof < 0 || menu_prof >= profs.n) {
+            snprintf(status_msg, sizeof status_msg, "No profile selected");
+            draw_menu(); return;
+        }
+        pe_prof = profs.p[menu_prof];
+        pe_idx = menu_prof;
+        snprintf(pe_port, sizeof pe_port, "%u", (unsigned)pe_prof.port);
+        pe_sel = 0; pe_err = 0; pe_err_msg[0] = 0;
+        state = ST_PE;
+        draw_pe();
+        return;
+    case ACT_DEL:
+        if (menu_prof < 0 || menu_prof >= profs.n) {
+            snprintf(status_msg, sizeof status_msg, "No profile selected");
+            draw_menu(); return;
+        }
+        del_idx = menu_prof;
+        pe_sel = 0;
+        state = ST_DELCONF;
+        draw_delconf();
+        return;
+    case ACT_LAN:
+        if (!net_ok) { snprintf(status_msg, sizeof status_msg, "No Wi-Fi connection"); draw_menu(); return; }
+        server_host[0] = 0;
+        server_port = profs.disc_port;
+        auto_connect = profs.disc_auto;
+        begin_connect();
+        return;
+    case ACT_AUTO:
+        if (menu_prof >= 0 && menu_prof < profs.n) {
+            profs.p[menu_prof].auto_connect ^= 1;
+            cfg_touch();
+        } else {
+            profs.disc_auto ^= 1;
+            cfg_touch();
+        }
         cfg_save();
         status_msg[0] = 0;
         draw_menu();
         return;
-    case 4:  /* Exit */
+    case ACT_EXIT:
         wup_log("thinclient: exit from menu");
+        cfg_save();
         state = ST_MENU;
         quit_app = 1;
         return;
     }
 }
 
-enum { EDIT_BACK = 11, EDIT_CLEAR, EDIT_SAVE, EDIT_CANCEL, EDIT_COUNT };
+/* ---- numeric keypad (ST_EDIT): IPv4 host entry or UDP port --------------- */
+enum { EKEY_BACK, EKEY_CLEAR, EKEY_SAVE, EKEY_CANCEL };
+#define EDIT_MAXKEYS 16
+static int edit_nkeys, edit_ndig;
+static int edit_ret;                              /* state to return to: ST_PE */
 
-static void edit_button_rect(int key, int *x, int *y, int *w, int *h) {
-    if (key < 12) {
+static void edit_key_rect(int key, int *x, int *y, int *w, int *h) {
+    if (key < edit_ndig) {                         /* digit grid, 3 columns */
         *x = 80 + (key % 3) * 120;
-        *y = 170 + (key / 3) * 65;
-        *w = 108; *h = 54;
-    } else {
-        *x = 470; *y = 170 + (key - 12) * 82;
-        *w = 304; *h = 70;
+        *y = 168 + (key / 3) * 56;
+        *w = 108; *h = 48;
+    } else {                                       /* action column */
+        *x = 470; *y = 168 + (key - edit_ndig) * 74;
+        *w = 304; *h = 66;
     }
 }
 
 static int edit_button_at(int x, int y) {
-    for (int key = 0; key < EDIT_COUNT; key++) {
+    for (int key = 0; key < edit_nkeys; key++) {
         int bx, by, bw, bh;
-        edit_button_rect(key, &bx, &by, &bw, &bh);
+        edit_key_rect(key, &bx, &by, &bw, &bh);
         if (x >= bx && x < bx + bw && y >= by && y < by + bh) return key;
     }
     return -1;
 }
 
-static const char *edit_button_label(int key) {
-    static const char *const labels[] = {
-        "1", "2", "3", "4", "5", "6", "7", "8", "9",
-        ".", "0", "Backspace", "Clear", "Save", "Cancel"
-    };
-    return labels[key];
+static const char *edit_key_label(int key) {
+    static const char *const digs_ip = "123456789.0";
+    static const char *const digs_pt = "1234567890";
+    static const char *const acts[] = { "Backspace", "Clear", "Save", "Cancel" };
+    const char *d = edit_mode ? digs_pt : digs_ip;
+    if (key < edit_ndig) {
+        static char one[2];
+        one[0] = d[key]; one[1] = 0;
+        return one;
+    }
+    return acts[key - edit_ndig];
+}
+
+static int edit_valid(void) {
+    return edit_mode ? prof_port_valid(edit_ip) : ip_editor_valid(edit_ip);
 }
 
 static void draw_edit(void) {
     wup_screen();
-    draw_brand(38, "Enter a fixed IPv4 address");
-    int valid = ip_editor_valid(edit_ip);
-    gfx_rrect(80, 104, 694, 50, 9, RGB(18, 28, 48), 230);
-    gfx_rrect_outline(80, 104, 694, 50, 9, 2,
+    draw_brand(30, edit_mode ? "UDP port (1-65535)" : "IPv4 address for the host field");
+    int valid = edit_valid();
+    gfx_rrect(80, 88, 694, 46, 9, RGB(18, 28, 48), 230);
+    gfx_rrect_outline(80, 88, 694, 46, 9, 2,
                       valid ? RGB(100, 210, 145) : RGB(105, 125, 165));
-    gfx_text_c(&font_big, GFX_W / 2, 140, edit_ip[0] ? edit_ip : "_", RGB(255, 255, 255));
+    gfx_text_c(&font_big, GFX_W / 2, 122, edit_ip[0] ? edit_ip : "_", RGB(255, 255, 255));
 
-    for (int key = 0; key < EDIT_COUNT; key++) {
+    for (int key = 0; key < edit_nkeys; key++) {
         int x, y, w, h, down = key == edit_touch && key == edit_hover;
-        int disabled = key == EDIT_SAVE && !valid;
-        edit_button_rect(key, &x, &y, &w, &h);
+        int disabled = key == edit_ndig + EKEY_SAVE && !valid;
+        edit_key_rect(key, &x, &y, &w, &h);
         px_t fill = disabled ? RGB(36, 42, 54) : down ? RGB(74, 138, 210) :
                     key == edit_sel ? RGB(46, 96, 168) : RGB(24, 38, 62);
         px_t text = disabled ? RGB(95, 105, 125) : RGB(240, 246, 255);
         gfx_rrect(x, y, w, h, 9, fill, 230);
         if (!disabled && (down || key == edit_sel))
             gfx_rrect_outline(x, y, w, h, 9, 2, RGB(130, 205, 255));
-        gfx_text_c(key == EDIT_BACK ? &font_small : &font_body,
-                   x + w / 2, y + h / 2 + 7, edit_button_label(key), text);
+        gfx_text_c(key < edit_ndig + EKEY_BACK ? &font_body :
+                   key == edit_ndig + EKEY_BACK ? &font_small : &font_body,
+                   x + w / 2, y + h / 2 + 7, edit_key_label(key), text);
     }
     gfx_text_c(&font_small, GFX_W / 2, 462,
                valid ? "Touch Save, or use D-pad + A   B: Cancel" :
-                       "Enter four octets from 0 to 255   B: Cancel",
+                       (edit_mode ? "Digits only, 1-65535   B: Cancel"
+                                  : "Enter four octets 0-255   B: Cancel"),
                RGB(145, 165, 200));
     gfx_present_all();
 }
 
-static void edit_from_saved(void) {
-    snprintf(edit_ip, sizeof edit_ip, "%s", server_host);
+static void edit_open(int mode, const char *initial, int ret_state) {
+    edit_mode = mode;
+    edit_ret = ret_state;
+    snprintf(edit_ip, sizeof edit_ip, "%s", initial);
+    edit_ndig = mode ? 10 : 11;
+    edit_nkeys = edit_ndig + 4;
     edit_sel = 0;
     edit_touch = edit_hover = -1;
+    state = ST_EDIT;
+    draw_edit();
 }
 
-static void edit_leave(const char *message) {
-    state = ST_MENU; menu_sel = 0;
-    snprintf(status_msg, sizeof status_msg, "%s", message);
-    draw_menu();
+static void edit_leave_pe(void) {
+    state = ST_PE;
+    draw_pe();
 }
 
 static void edit_activate(int key) {
-    static const char digits[] = "123456789.0";
-    if (key >= 0 && key < 11) ip_editor_append(edit_ip, sizeof edit_ip, digits[key]);
-    else if (key == EDIT_BACK) ip_editor_backspace(edit_ip);
-    else if (key == EDIT_CLEAR) edit_ip[0] = 0;
-    else if (key == EDIT_SAVE) {
-        if (!ip_editor_valid(edit_ip)) return;
-        snprintf(server_host, sizeof server_host, "%s", edit_ip);
-        cfg_save();
-        edit_leave("Server address saved");
+    static const char digs_ip[] = "123456789.0";
+    static const char digs_pt[] = "1234567890";
+    const char *d = edit_mode ? digs_pt : digs_ip;
+    if (key >= 0 && key < edit_ndig) {
+        char ch = d[key];
+        if (edit_mode) {
+            /* port: digits only */
+            size_t l = strlen(edit_ip);
+            if (l + 1 < sizeof edit_ip) { edit_ip[l] = ch; edit_ip[l + 1] = 0; }
+        } else {
+            ip_editor_append(edit_ip, sizeof edit_ip, ch);
+        }
+    } else if (key == edit_ndig + EKEY_BACK) ip_editor_backspace(edit_ip);
+    else if (key == edit_ndig + EKEY_CLEAR) edit_ip[0] = 0;
+    else if (key == edit_ndig + EKEY_SAVE) {
+        if (!edit_valid()) return;
+        if (edit_ret == ST_KBD) {
+            snprintf(kbd_buf, sizeof kbd_buf, "%s", edit_ip);   /* IPv4 into host field */
+            kbd_len = (int)strlen(kbd_buf);
+            state = ST_KBD;
+            draw_kbd();
+        } else {
+            snprintf(pe_port, sizeof pe_port, "%s", edit_ip);
+            edit_leave_pe();
+        }
         return;
-    } else if (key == EDIT_CANCEL) {
-        edit_leave("Address unchanged");
+    } else if (key == edit_ndig + EKEY_CANCEL) {
+        edit_leave_pe();
         return;
     }
     draw_edit();
+}
+
+/* ---- profile editor (ST_PE) ------------------------------------------------ */
+static void draw_pe(void) {
+    wup_screen();
+    draw_brand(30, pe_idx >= 0 ? "Edit connection" : "New connection");
+    static const char *const flabels[] = { "Name", "Host", "Port", "Auto-connect" };
+    static const char *const fvals[] = { NULL, NULL, NULL, NULL };
+    (void)fvals;
+    char val[PROF_HOST_MAX + 8];
+    for (int i = 0; i < 4; i++) {
+        int y = 86 + i * 42;
+        int sel = pe_sel == i;
+        if (sel) {
+            gfx_rrect(60, y, GFX_W - 120, 36, 8, RGB(46, 96, 168), 220);
+            gfx_rrect_outline(60, y, GFX_W - 120, 36, 8, 1, RGB(120, 190, 255));
+        }
+        gfx_text(&font_body, 84, y + 24, flabels[i],
+                 sel ? RGB(255, 255, 255) : RGB(170, 190, 220));
+        const char *v;
+        char abuf[8];
+        switch (i) {
+        case 0: v = pe_prof.name; break;
+        case 1: v = pe_prof.host; break;
+        case 2: v = pe_port; break;
+        default:
+            snprintf(abuf, sizeof abuf, "%s", pe_prof.auto_connect ? "on" : "off");
+            v = abuf;
+        }
+        /* keep the tail visible when the value overflows the field */
+        size_t vl = strlen(v);
+        const char *show = v;
+        if (vl > 52) { show = v + vl - 52; val[0] = '<'; }
+        snprintf(val + (show != v), sizeof val - (show != v), "%s", show);
+        gfx_text(&font_body, 320, y + 24, val,
+                 v[0] ? (sel ? RGB(255, 255, 255) : RGB(215, 225, 245))
+                      : (sel ? RGB(140, 170, 210) : RGB(110, 125, 155)));
+    }
+    /* endpoint preview: host:port, tail kept visible */
+    {
+        char ep[PROF_HOST_MAX + 8], ebuf[80];
+        snprintf(ep, sizeof ep, "%s:%s",
+                 pe_prof.host[0] ? pe_prof.host : "-",
+                 pe_port[0] ? pe_port : "-");
+        size_t el = strlen(ep);
+        const char *eshow = ep;
+        ebuf[0] = 0;
+        if (el > 58) { eshow = ep + el - 58; ebuf[0] = '<'; }
+        strncat(ebuf, eshow, sizeof ebuf - strlen(ebuf) - 1);
+        gfx_text_c(&font_small, GFX_W / 2, 266, ebuf, RGB(140, 190, 235));
+    }
+    if (pe_err)
+        gfx_text_c(&font_body, GFX_W / 2, 288, pe_err_msg, RGB(255, 150, 130));
+    /* Save / Cancel buttons (pe_sel 4 / 5) */
+    static const char *const bl[] = { "Save", "Cancel" };
+    for (int i = 0; i < 2; i++) {
+        int x = i ? 500 : 190, y = 312, w = 170, h = 44;
+        int sel = pe_sel == 4 + i;
+        int enabled = i == 1 || pe_prof.name[0] || pe_prof.host[0];
+        px_t fill = !enabled ? RGB(30, 36, 48) : sel ? RGB(46, 96, 168) : RGB(24, 38, 62);
+        px_t text = !enabled ? RGB(110, 120, 140) : RGB(240, 246, 255);
+        gfx_rrect(x, y, w, h, 8, fill, 230);
+        if (sel && enabled) gfx_rrect_outline(x, y, w, h, 8, 2, RGB(130, 205, 255));
+        gfx_text_c(&font_body, x + w / 2, y + h / 2 + 7, bl[i], text);
+    }
+    gfx_text_c(&font_small, GFX_W / 2, 452,
+               "D-pad + A   touch   B: Cancel   fields: Name/Host alphanumeric, Port numeric",
+               RGB(140, 155, 190));
+    gfx_present_all();
+}
+
+static void pe_field_touch(int idx) {              /* 0..3 field, 4 save, 5 cancel */
+    pe_sel = idx;
+    if (idx == 4) { pe_save(); return; }
+    if (idx == 5) { state = ST_MENU; draw_menu(); return; }
+    if (idx == 0) {                                 /* name -> alphanumeric kbd */
+        snprintf(kbd_buf, sizeof kbd_buf, "%s", pe_prof.name);
+        kbd_len = (int)strlen(kbd_buf); kbd_target = 0;
+        kbd_open();
+    } else if (idx == 1) {                          /* host -> alphanumeric kbd */
+        snprintf(kbd_buf, sizeof kbd_buf, "%s", pe_prof.host);
+        kbd_len = (int)strlen(kbd_buf); kbd_target = 1;
+        kbd_open();
+    } else if (idx == 2) {                          /* port -> numeric pad */
+        edit_open(1, pe_port, ST_PE);
+    } else if (idx == 3) {                          /* auto-connect toggle */
+        pe_prof.auto_connect ^= 1;
+        draw_pe();
+    }
+}
+
+static void pe_activate(int sel) {
+    if (sel >= 0 && sel <= 5) { pe_field_touch(sel); return; }
+}
+
+static void pe_save(void) {
+    pe_err = 0; pe_err_msg[0] = 0;
+    if (!prof_name_valid(pe_prof.name)) {
+        pe_err = 1; snprintf(pe_err_msg, sizeof pe_err_msg,
+            "Name: 1-%d chars, letters/digits/space . - _",
+            PROF_NAME_MAX - 1); draw_pe(); return;
+    }
+    if (!prof_host_valid(pe_prof.host)) {
+        pe_err = 2; snprintf(pe_err_msg, sizeof pe_err_msg,
+            "Host: DNS name or IPv4, no spaces/URL parts"); draw_pe(); return;
+    }
+    if (!prof_port_valid(pe_port)) {
+        pe_err = 3; snprintf(pe_err_msg, sizeof pe_err_msg,
+            "Port: digits only, 1-65535"); draw_pe(); return;
+    }
+    pe_prof.port = (uint16_t)prof_port_num(pe_port);
+    pe_prof.type = PROF_TYPE_UDP;
+    int idx;
+    if (pe_idx >= 0) {
+        profs.p[pe_idx] = pe_prof;
+        idx = pe_idx;
+    } else {
+        idx = prof_add(&profs, &pe_prof);
+        if (idx < 0) {
+            pe_err = 1; snprintf(pe_err_msg, sizeof pe_err_msg,
+                "Cannot save: list full or invalid data"); draw_pe(); return;
+        }
+    }
+    profs.sel = idx;
+    menu_prof = idx;
+    cfg_touch(); cfg_save();
+    state = ST_MENU; menu_sel = idx < profs.n ? idx : 0;
+    snprintf(status_msg, sizeof status_msg, "Connection saved");
+    draw_menu();
+}
+
+/* pe field/button hit test: fields are full-width rows, buttons fixed */
+static int pe_hit(int x, int y) {
+    for (int i = 0; i < 4; i++) {
+        int fy = 86 + i * 42;
+        if (y >= fy && y < fy + 36 && x >= 60 && x <= GFX_W - 60) return i;
+    }
+    if (y >= 312 && y < 356) {
+        if (x >= 190 && x < 360) return 4;
+        if (x >= 500 && x < 670) return 5;
+    }
+    return -1;
+}
+
+/* ---- alphanumeric keyboard (ST_KBD) ---------------------------------------- */
+enum { KK_CHAR, KK_SHIFT, KK_BKSP, KK_CLR, KK_SPACE, KK_IP, KK_SAVE, KK_CANCEL };
+typedef struct {
+    char ch; const char *label; int kind;
+    int row, col, x, y, w, h;
+} kkey_t;
+static kkey_t kkeys[64];
+static int kbd_n;
+static int kbd_shift;
+static int kbd_sel = -1, kbd_touch = -1, kbd_hover = -1;
+
+static int kbd_char_ok(int target, char ch) {
+    if (target == 0) return prof_name_valid((char[]){ ch, 0 });
+    return (ch >= 'A' && ch <= 'Z') || (ch >= 'a' && ch <= 'z') ||
+           (ch >= '0' && ch <= '9') || ch == '.' || ch == '-';
+}
+
+static void kbd_layout(void) {
+    static const char *const rows[] = {
+        "1234567890", "qwertyuiop", "asdfghjkl.-", "zxcvbnm_"
+    };
+    kbd_n = 0;
+    int y = 128;
+    for (int r = 0; r < 4; r++) {
+        int n = (int)strlen(rows[r]);
+        int pitch = 76, w = 70, h = 42;
+        int x0 = (GFX_W - n * pitch) / 2;
+        for (int c = 0; c < n; c++) {
+            kkey_t *k = &kkeys[kbd_n++];
+            memset(k, 0, sizeof *k);
+            k->kind = KK_CHAR;
+            k->ch = rows[r][c];
+            k->row = r; k->col = c;
+            k->x = x0 + c * pitch; k->y = y; k->w = w; k->h = h;
+        }
+        y += 50;
+    }
+    /* action row */
+    struct { const char *l; int kind; int w; } acts[] = {
+        { "SPACE", KK_SPACE, 150 }, { "aA", KK_SHIFT, 84 },
+        { "Bksp", KK_BKSP, 84 }, { "Clr", KK_CLR, 84 },
+        { "IP", KK_IP, 76 }, { "Save", KK_SAVE, 120 }, { "Cancel", KK_CANCEL, 120 }
+    };
+    int x = 20, ay = 336;
+    for (unsigned i = 0; i < sizeof acts / sizeof acts[0]; i++) {
+        kkey_t *k = &kkeys[kbd_n++];
+        memset(k, 0, sizeof *k);
+        k->kind = acts[i].kind;
+        k->label = acts[i].l;
+        k->row = 4; k->col = (int)i;
+        k->x = x; k->y = ay; k->w = acts[i].w; k->h = 46;
+        x += acts[i].w + 8;
+    }
+}
+
+static void kbd_open(void) {
+    kbd_layout();
+    kbd_shift = 0;
+    kbd_sel = 0; kbd_touch = kbd_hover = -1;
+    state = ST_KBD;
+    draw_kbd();
+}
+
+static int kbd_key_enabled(const kkey_t *k) {
+    if (k->kind == KK_CHAR) {
+        char ch = k->ch;
+        if (kbd_shift && ch >= 'a' && ch <= 'z') ch -= 32;
+        return kbd_char_ok(kbd_target, ch);
+    }
+    if (k->kind == KK_SPACE) return kbd_target == 0;   /* space: names only */
+    if (k->kind == KK_IP)   return kbd_target == 1;   /* IPv4 pad: host only */
+    return 1;
+}
+
+static void kbd_key_label(char *out, size_t sz, const kkey_t *k) {
+    if (k->kind == KK_CHAR) {
+        char ch = k->ch;
+        if (kbd_shift && ch >= 'a' && ch <= 'z') ch = (char)(ch - 32);
+        snprintf(out, sz, "%c", ch);
+    } else if (k->kind == KK_SHIFT) {
+        snprintf(out, sz, "%s", kbd_shift ? "AA" : "aA");
+    } else {
+        snprintf(out, sz, "%s", k->label);
+    }
+}
+
+static void draw_kbd(void) {
+    wup_screen();
+    draw_brand(26, kbd_target == 0 ? "Connection name" : "Hostname or IPv4");
+    /* echo bar: show the tail so long hostnames stay readable */
+    int valid = kbd_target == 0 ? prof_name_valid(kbd_buf)
+                                : prof_host_valid(kbd_buf);
+    gfx_rrect(60, 76, GFX_W - 120, 44, 9, RGB(18, 28, 48), 230);
+    gfx_rrect_outline(60, 76, GFX_W - 120, 44, 9, 2,
+                      valid ? RGB(100, 210, 145) : RGB(105, 125, 165));
+    const char *show = kbd_buf;
+    size_t kl = (size_t)kbd_len;
+    char tail[72];
+    if (kl > 44) {
+        memcpy(tail, kbd_buf + kl - 44, 44);
+        tail[44] = 0;
+        show = tail;
+        gfx_text(&font_small, 74, 106, "<", RGB(140, 155, 190));
+    }
+    gfx_text(&font_body, 80, 106, kbd_len ? show : "_",
+             RGB(255, 255, 255));
+    gfx_text(&font_small, GFX_W - 80, 106, "|", RGB(120, 140, 175));
+
+    char lb[8];
+    for (int i = 0; i < kbd_n; i++) {
+        kkey_t *k = &kkeys[i];
+        int en = kbd_key_enabled(k);
+        int down = i == kbd_touch && i == kbd_hover;
+        px_t fill = !en ? RGB(26, 30, 40) : down ? RGB(74, 138, 210) :
+                    i == kbd_sel ? RGB(46, 96, 168) : RGB(24, 38, 62);
+        px_t text = !en ? RGB(90, 100, 125) : RGB(240, 246, 255);
+        gfx_rrect(k->x, k->y, k->w, k->h, 8, fill, 235);
+        if (en && (down || i == kbd_sel))
+            gfx_rrect_outline(k->x, k->y, k->w, k->h, 8, 2, RGB(130, 205, 255));
+        kbd_key_label(lb, sizeof lb, k);
+        gfx_text_c(k->kind == KK_CHAR ? &font_body : &font_small,
+                   k->x + k->w / 2, k->y + k->h / 2 + 6, lb, text);
+    }
+    gfx_text_c(&font_small, GFX_W / 2, 408,
+               kbd_target == 0
+                 ? "Letters, digits, space, . - _   B: Cancel"
+                 : "Letters, digits, . -   IP: numeric pad   B: Cancel",
+               RGB(140, 155, 190));
+    gfx_present_all();
+}
+
+static int kbd_hit(int x, int y) {
+    for (int i = 0; i < kbd_n; i++)
+        if (x >= kkeys[i].x && x < kkeys[i].x + kkeys[i].w &&
+            y >= kkeys[i].y && y < kkeys[i].y + kkeys[i].h)
+            return i;
+    return -1;
+}
+
+/* geometric D-pad move: up/down pick the nearest key by x in the adjacent
+   row; left/right step within the same row */
+static void kbd_move(int dx, int dy) {
+    if (kbd_sel < 0) { kbd_sel = 0; return; }
+    kkey_t *cur = &kkeys[kbd_sel];
+    if (dx) {
+        int best = -1, bd = 1 << 28;
+        for (int i = 0; i < kbd_n; i++) {
+            if (kkeys[i].row != cur->row) continue;
+            int d = (kkeys[i].col - cur->col) * (dx > 0 ? 1 : -1);
+            if (d > 0 && d < bd) { bd = d; best = i; }
+        }
+        if (best >= 0) kbd_sel = best;
+    } else if (dy) {
+        int trow = cur->row + dy;
+        int best = -1, bd = 1 << 28, ccx = cur->x + cur->w / 2;
+        for (int i = 0; i < kbd_n; i++) {
+            if (kkeys[i].row != trow) continue;
+            int d = kkeys[i].x + kkeys[i].w / 2 - ccx;
+            if (d < 0) d = -d;
+            if (d < bd) { bd = d; best = i; }
+        }
+        if (best >= 0) kbd_sel = best;
+    }
+}
+
+static void kbd_append_char(char ch) {
+    if (kbd_len + 1 >= PROF_HOST_MAX) return;
+    kbd_buf[kbd_len++] = ch;
+    kbd_buf[kbd_len] = 0;
+}
+
+static void kbd_press(int idx) {
+    if (idx < 0 || idx >= kbd_n) return;
+    kkey_t *k = &kkeys[idx];
+    if (!kbd_key_enabled(k)) return;
+    switch (k->kind) {
+    case KK_CHAR: {
+        char ch = k->ch;
+        if (kbd_shift && ch >= 'a' && ch <= 'z') ch = (char)(ch - 32);
+        kbd_append_char(ch);
+        break;
+    }
+    case KK_SHIFT: kbd_shift ^= 1; break;
+    case KK_BKSP:
+        if (kbd_len > 0) kbd_buf[--kbd_len] = 0;
+        break;
+    case KK_CLR: kbd_len = 0; kbd_buf[0] = 0; break;
+    case KK_SPACE: kbd_append_char(' '); break;
+    case KK_IP:
+        edit_open(0, kbd_buf, ST_KBD);      /* numeric IPv4 into host field */
+        return;
+    case KK_SAVE: {
+        if (kbd_target == 0) {
+            if (!prof_name_valid(kbd_buf)) {
+                pe_err = 1;
+                snprintf(pe_err_msg, sizeof pe_err_msg, "Invalid name");
+                state = ST_PE; draw_pe(); return;
+            }
+            snprintf(pe_prof.name, sizeof pe_prof.name, "%s", kbd_buf);
+        } else {
+            if (!prof_host_valid(kbd_buf)) {
+                pe_err = 2;
+                snprintf(pe_err_msg, sizeof pe_err_msg, "Invalid host");
+                state = ST_PE; draw_pe(); return;
+            }
+            snprintf(pe_prof.host, sizeof pe_prof.host, "%s", kbd_buf);
+        }
+        pe_err = 0;
+        state = ST_PE; draw_pe();
+        return;
+    }
+    case KK_CANCEL:
+        state = ST_PE; draw_pe();
+        return;
+    }
+    draw_kbd();
+}
+
+/* ---- delete confirmation (ST_DELCONF) --------------------------------------- */
+static void draw_delconf(void) {
+    wup_screen();
+    draw_brand(120, "Delete this connection?");
+    char line[96];
+    if (del_idx >= 0 && del_idx < profs.n)
+        snprintf(line, sizeof line, "\"%s\" (%s:%u)", profs.p[del_idx].name,
+                 profs.p[del_idx].host, (unsigned)profs.p[del_idx].port);
+    else
+        snprintf(line, sizeof line, "?");
+    gfx_text_c(&font_body, GFX_W / 2, 190, line, RGB(230, 220, 200));
+    gfx_text_c(&font_small, GFX_W / 2, 220, "This cannot be undone", RGB(140, 155, 190));
+    static const char *const bl[] = { "Delete", "Keep" };
+    for (int i = 0; i < 2; i++) {
+        int x = i ? 480 : 140, y = 270, w = 230, h = 52;
+        int sel = pe_sel == i;
+        px_t fill = sel ? RGB(46, 96, 168) : RGB(24, 38, 62);
+        gfx_rrect(x, y, w, h, 9, fill, 230);
+        if (sel) gfx_rrect_outline(x, y, w, h, 9, 2, RGB(130, 205, 255));
+        gfx_text_c(&font_body, x + w / 2, y + h / 2 + 7, bl[i], RGB(240, 246, 255));
+    }
+    gfx_text_c(&font_small, GFX_W / 2, 380, "B: keep", RGB(140, 155, 190));
+    gfx_present_all();
+}
+
+static int delconf_hit(int x, int y) {
+    if (y >= 270 && y < 322) {
+        if (x >= 140 && x < 370) return 0;
+        if (x >= 480 && x < 710) return 1;
+    }
+    return -1;
+}
+
+static void delconf_activate(int sel) {
+    if (sel == 0 && del_idx >= 0 && del_idx < profs.n) {
+        prof_del(&profs, del_idx);
+        if (profs.sel >= profs.n) profs.sel = profs.n - 1;
+        if (menu_prof >= profs.n) menu_prof = profs.n - 1;
+        cfg_touch(); cfg_save();
+        state = ST_MENU; menu_sel = 0;
+        snprintf(status_msg, sizeof status_msg, "Connection deleted");
+    } else {
+        state = ST_MENU;
+        snprintf(status_msg, sizeof status_msg, "Delete cancelled");
+    }
+    draw_menu();
 }
 
 static void end_session(void) {
@@ -755,8 +1400,7 @@ static void packet(const u8 *d, u32 len, const struct sockaddr_in *from, u32 now
         /* the server ended the session: reconnect when auto-connect is on */
         if (auto_connect) {
             next_state = ST_CONNECTING;
-            conn_target = last_peer_ip;
-            snprintf(status_msg, sizeof status_msg, "Server ended - reconnecting");
+            pending_resolve = 1;
         } else {
             next_state = ST_MENU;
             snprintf(status_msg, sizeof status_msg, "Server ended the session");
@@ -769,8 +1413,7 @@ static void packet(const u8 *d, u32 len, const struct sockaddr_in *from, u32 now
 static void peer_lost(u32 now) {
     if (auto_connect) {
         next_state = ST_CONNECTING;
-        conn_target = last_peer_ip;
-        snprintf(status_msg, sizeof status_msg, "Connection lost - reconnecting");
+        pending_resolve = 1;
     } else {
         next_state = ST_MENU;
         snprintf(status_msg, sizeof status_msg, "Connection to server lost");
@@ -876,9 +1519,8 @@ static void ingame_activate(int sel) {
     case 0: resume_stream(); break;
     case 1: next_state = ST_MENU; snprintf(status_msg, sizeof status_msg, "Disconnected");
             end_session(); break;
-    case 2: next_state = ST_CONNECTING; conn_target = last_peer_ip;
+    case 2: next_state = ST_CONNECTING; pending_resolve = 1;
             snprintf(status_msg, sizeof status_msg, "Reconnecting ...");
-            conn_deadline = clock_ms() + 15000;
             end_session(); break;
     case 3: ingame_sub = 1; draw_ingame(); break;
     case 4: quit_app = 1; break;
@@ -906,20 +1548,28 @@ int main(void) {
             diag_thread = wup_thread_start(diag_worker, NULL, 2048, 1);
         }
     }
-    /* start in the connection menu; auto-connect skips straight to dialing */
+    /* start in the connection menu; auto-connect only fires for the selected
+       startup profile flagged auto-connect, or for migrated LAN discovery */
     menu_sel = 0;
-    if (net_ok && auto_connect) {
-        state = ST_CONNECTING;
-        if (resolve_server()) {
-            conn_target = server_addr;
-            conn_deadline = clock_ms() + 15000;
-        } else {
-            state = ST_MENU; menu_sel = 0;
-            snprintf(status_msg, sizeof status_msg, "Cannot resolve %s", server_host);
-            draw_menu();
+    menu_prof = profs.sel >= 0 && profs.sel < profs.n ? profs.sel
+                     : (profs.n ? 0 : -1);
+    int startup_connect = 0;
+    if (net_ok) {
+        if (menu_prof >= 0 && profs.p[menu_prof].auto_connect) {
+            use_profile_endpoint(menu_prof);
+            startup_connect = 1;
+        } else if (profs.disc_auto) {
+            server_host[0] = 0;
+            server_port = profs.disc_port;
+            auto_connect = profs.disc_auto;
+            startup_connect = 1;
         }
-        status_msg[0] = 0;
-        draw_connecting();
+    }
+    if (startup_connect) {
+        begin_connect();
+        if (state != ST_CONNECTING) {              /* DNS failure: menu + error */
+            menu_sel = 0;
+        }
     } else {
         state = ST_MENU;
         status_msg[0] = 0;
@@ -984,6 +1634,13 @@ int main(void) {
             if (hk_ev & HK_EV_BRIGHT_DN)  local_light_step(-1);
         }
 
+        /* a reconnect queued by peer_lost/'Q'/ingame Reconnect: re-resolve
+           the endpoint (the hostname may now answer with a new address) */
+        if (state == ST_CONNECTING && pending_resolve) {
+            pending_resolve = 0;
+            begin_connect();
+        }
+
         /* connect attempt timed out: back to the menu */
         if (state == ST_CONNECTING && !peer_on && (int)(now - conn_deadline) >= 0) {
             state = ST_MENU; menu_sel = 0;
@@ -1003,22 +1660,87 @@ int main(void) {
                 int key = edit_touch, activate = edit_hover == edit_touch;
                 edit_touch = edit_hover = -1;
                 if (activate) edit_activate(key); else draw_edit();
-            } else if (pressed & WUP_B) edit_activate(EDIT_CANCEL);
-            else if (pressed & WUP_LEFT)  { if (edit_sel > 0) edit_sel--; draw_edit(); }
-            else if (pressed & WUP_RIGHT) { if (edit_sel + 1 < EDIT_COUNT) edit_sel++; draw_edit(); }
-            else if (pressed & WUP_UP)    { edit_sel = edit_sel >= 3 ? edit_sel - 3 : 0; draw_edit(); }
-            else if (pressed & WUP_DOWN)  { edit_sel = edit_sel + 3 < EDIT_COUNT ? edit_sel + 3 : EDIT_COUNT - 1; draw_edit(); }
-            else if (pressed & WUP_A) edit_activate(edit_sel);
+            } else if (pressed & WUP_B) { state = ST_PE; draw_pe(); }
+            else if (pressed & WUP_LEFT || pressed & WUP_RIGHT) {
+                int d = (pressed & WUP_RIGHT) ? 1 : -1;
+                if (edit_sel >= edit_ndig) {           /* action column: vertical */
+                    if (pressed & WUP_LEFT) edit_sel = edit_ndig - 1;
+                } else {
+                    int col = edit_sel % 3;
+                    if (col == 2 && d > 0 && edit_sel + 1 < edit_ndig)
+                        edit_sel = edit_ndig;          /* into action column */
+                    else {
+                        int ns = edit_sel + d;
+                        if (ns >= 0 && ns < edit_ndig) edit_sel = ns;
+                    }
+                }
+                draw_edit();
+            } else if (pressed & WUP_UP || pressed & WUP_DOWN) {
+                int d = (pressed & WUP_DOWN) ? 1 : -1;
+                if (edit_sel >= edit_ndig) {           /* action column */
+                    int ns = edit_sel + d;
+                    if (ns >= edit_ndig && ns < edit_nkeys) edit_sel = ns;
+                } else {
+                    int ns = edit_sel + 3 * d;
+                    if (ns < 0) ns = edit_sel % 3;
+                    if (ns >= edit_ndig) ns = edit_ndig - 1 - (edit_ndig - 1 - ns) % 3;
+                    if (ns >= edit_ndig) ns = edit_ndig - 1;
+                    edit_sel = ns;
+                }
+                draw_edit();
+            } else if (pressed & WUP_A) edit_activate(edit_sel);
             held = b;
             continue;
         }
         if (state == ST_MENU) {
-            int hit = tpress ? menu_hit(tx, ty) : -1;
-            if (hit >= 0) { menu_sel = hit; menu_activate(hit); }
-            else if (pressed & WUP_UP)    { menu_sel = (menu_sel + 4) % 5; draw_menu(); }
-            else if (pressed & WUP_DOWN)  { menu_sel = (menu_sel + 1) % 5; draw_menu(); }
+            int total = profs.n + ACT_COUNT;
+            int hit = tpress ? prof_hit(tx, ty) : -1;
+            if (hit >= 0) {
+                if (hit < profs.n) {                 /* profile row: select, never connect */
+                    menu_sel = menu_prof = hit;
+                    if (profs.sel != hit) { profs.sel = hit; cfg_touch(); }
+                    draw_menu();
+                } else {
+                    menu_sel = hit;
+                    menu_activate(hit);
+                }
+            } else if (pressed & WUP_UP)    { menu_sel = (menu_sel + total - 1) % total; draw_menu(); }
+            else if (pressed & WUP_DOWN)  { menu_sel = (menu_sel + 1) % total; draw_menu(); }
             else if (pressed & WUP_A)     { menu_activate(menu_sel); }
             else if (pressed & WUP_B)     { quit_app = 1; }
+        } else if (state == ST_PE) {
+            int hit = tpress ? pe_hit(tx, ty) : -1;
+            if (hit >= 0) { pe_sel = hit; pe_field_touch(hit); }
+            else if (pressed & WUP_UP)    { if (pe_sel > 0) pe_sel--; draw_pe(); }
+            else if (pressed & WUP_DOWN)  { if (pe_sel < 5) pe_sel++; draw_pe(); }
+            else if (pressed & WUP_LEFT)  { if (pe_sel == 5) { pe_sel = 4; draw_pe(); } }
+            else if (pressed & WUP_RIGHT) { if (pe_sel == 4) { pe_sel = 5; draw_pe(); } }
+            else if (pressed & WUP_A)     { pe_activate(pe_sel); }
+            else if (pressed & WUP_B)     { state = ST_MENU; draw_menu(); }
+        } else if (state == ST_KBD) {
+            if (tpress) {
+                kbd_touch = kbd_hover = kbd_hit(tx, ty);
+                if (kbd_touch >= 0) { kbd_sel = kbd_touch; draw_kbd(); }
+            } else if (tnow && kbd_touch >= 0) {
+                int hover = kbd_hit(tx, ty);
+                if (hover != kbd_hover) { kbd_hover = hover; draw_kbd(); }
+            } else if (trelease && kbd_touch >= 0) {
+                int key = kbd_touch, activate = kbd_hover == kbd_touch;
+                kbd_touch = kbd_hover = -1;
+                if (activate) kbd_press(key); else draw_kbd();
+            } else if (pressed & WUP_B) { state = ST_PE; pe_err = 0; draw_pe(); }
+            else if (pressed & WUP_LEFT)  { kbd_move(-1, 0); draw_kbd(); }
+            else if (pressed & WUP_RIGHT) { kbd_move(1, 0); draw_kbd(); }
+            else if (pressed & WUP_UP)    { kbd_move(0, -1); draw_kbd(); }
+            else if (pressed & WUP_DOWN)  { kbd_move(0, 1); draw_kbd(); }
+            else if (pressed & WUP_A)     { if (kbd_sel >= 0) kbd_press(kbd_sel); }
+        } else if (state == ST_DELCONF) {
+            int hit = tpress ? delconf_hit(tx, ty) : -1;
+            if (hit >= 0) { pe_sel = hit; delconf_activate(hit); }
+            else if (pressed & WUP_LEFT)  { pe_sel = 0; draw_delconf(); }
+            else if (pressed & WUP_RIGHT) { pe_sel = 1; draw_delconf(); }
+            else if (pressed & WUP_A)     { delconf_activate(pe_sel); }
+            else if (pressed & WUP_B)     { delconf_activate(1); }
         } else if (state == ST_CONNECTING) {
             if (pressed & WUP_B) {
                 state = ST_MENU; menu_sel = 0;
@@ -1043,6 +1765,7 @@ int main(void) {
         held = b;
     }
     if (peer_on) end_session();
+    cfg_save();
     diag_run = 0;
     if (diag_thread >= 0 && wup_thread_join(diag_thread, 1000)) wup_thread_kill(diag_thread);
     return 0;
