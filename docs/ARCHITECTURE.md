@@ -25,11 +25,16 @@ Derived from WUP Stream's pad client and migrated to WUP Homebrew V2.
 Unchanged core:
 
 - UDP socket :50000, broadcast `B` beacons to :50002 (WUP Stream uses :50001).
-- `H`/`V`/`A`/`R`/`Q` packet handling; `I`/`N`/`M` transmit.
+- `H`/`V`/`A`/`R`/`Q`/`K` packet handling; `I`/`N`/`M`/`C` transmit.
 - V2 kernel-owned hardware decode through `wup_video_*`, bounded whole-frame
   reassembly (`as[NASM]`), NACK (`nack`), and watchdog keyframe recovery.
 - PCM audio queue (`wup_audio_*`), mic (`wup_mic_*`), rumble, backlight,
   flight-recorder diagnostics (`diag_*`).
+- V2 hardware camera encoder (`wup_camera_encode_*`): two bounded 64 KiB
+  buffers, at most four 1024-byte fragments per poll, with six network queue
+  entries reserved for input and NACK traffic. Capture starts only when the
+  server requests it, pauses with the local menu, and stops before video
+  shutdown.
 
 Added for ThinClient:
 

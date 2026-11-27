@@ -5,6 +5,9 @@ desktop: it receives the video stream and audio from a
 [WUP ThinServer](https://github.com/wozt/wup-thinserver), plays them through
 the GamePad's hardware H.264 decoder and speakers, and sends the touchscreen,
 sticks, buttons, motion sensors, microphone and volume slider back.
+When requested by a compatible server, it can also uplink the GamePad's
+640×480 camera through the V2 hardware H.264 encoder; capture is off by
+default.
 
 All Linux applications (Firefox ESR, Thunar, XFCE Terminal, Onboard
 on-screen keyboard, ...) run inside the ThinServer session — nothing Linux
@@ -93,7 +96,7 @@ for an explicit **Connect**.
 Builds reproducibly to `build/apps/wup_thinclient.wup` and deploys to the
 NetFS share. **Core streaming validated on physical GamePad hardware**
 (desktop visible and usable, developer-reported); the connection menu and
-in-stream HOME menu are new and pending physical retest.
+in-stream HOME menu and camera uplink are pending physical retest.
 See [docs/PROJECT_STATUS.md](docs/PROJECT_STATUS.md).
 
 ## License

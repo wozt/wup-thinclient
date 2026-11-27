@@ -12,7 +12,9 @@ HOME shortcut state machine (`tests/test_home_keys.c` — host-compiled
 `pad/home_keys.c`): short tap vs 5 s hold, HOME+X/Up/Down/B combos, button
 and release ordering, remote-input leak prevention, repeated presses.
 The packet/frame logic in `pad/main.c` is hardware-tied and cannot run on the
-host; it is shared with the stable upstream implementation.
+host; the camera sender is a narrow port of the physically validated upstream
+V2 implementation. The build verifies the exact `wup_camera_encode_*` API and
+the bounded-memory layout, but does not constitute physical camera evidence.
 
 ## Build reproducibility
 
@@ -42,5 +44,8 @@ dependencies on first build.
 | 11 | HOME+B 2 s | app exits, session stays alive server-side |
 | 12 | Auto-connect on + Wi-Fi loss/recovery | auto-reconnects to the last server, or returns cleanly to the menu |
 | 13 | 10-min stream | no freeze, memory stable |
+| 14 | Enable Preview only in ThinServer Settings | camera activates, live 4:3 image appears; desktop video/audio/input continue |
+| 15 | Disable Preview, enable Announce | preview clears; `/dev/video42` receives live frames; camera stays active |
+| 16 | Disable both camera consumers | camera activity/network traffic stop; desktop stream remains connected |
 
 Never report hardware results without actually running them.

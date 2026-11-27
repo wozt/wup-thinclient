@@ -1,7 +1,7 @@
 /* WUP ThinClient: a WUP ThinServer desktop on the Wii U GamePad.
  *
- * This is the WUP Stream pad receiver (wup-stream/pad/main.c, upstream
- * e1b0430) adapted into a standalone homebrew with its own identity and a
+ * This is the WUP Stream pad receiver adapted into a standalone homebrew
+ * with its own identity and a
  * local connection menu: manual server IP entry, saved configuration and a
  * disconnect action. The wire protocol is unchanged — see
  * wup-thinserver/docs/PROTOCOL.md.
@@ -9,15 +9,17 @@
  * Protocol (UDP, little endian). The pad listens on port 50000.
  *   pad -> broadcast:50002  'B' version 1 0                      every second while no server is connected
  *     (direct endpoints: unicast 'B' to host:port instead)
- *   server -> pad   'H' version flags(1 = send the microphone) light  hello / keepalive (every 250 ms); light: the
+ *   server -> pad   'H' version flags(1 = microphone, 2 = camera) light  hello / keepalive (every 250 ms); light: the
  *                                                                 backlight 1..6 (0 = leave it), bit 6 = off, bit 7 = keep it
  *                'V' flags(1 = keyframe) 0 0, u32 frame, u32 offset, u32 total, then <= 1400 bytes
  *                'A' 0 0 0, u32 seq, then 48 kHz 16-bit stereo PCM (a multiple of 16 bytes)
  *                'R' on(1)/off(0)                                 the rumble motor (said again with every frame while on)
  *                'Q'                                             the server is done
+ *                'K'                                             restart the camera encoder after a lost frame
  *   pad -> server 'M' 0 0 0, u32 sample number, then the microphone: 16-bit mono 48 kHz
+ *   pad -> server 'C' run part parts, u32 frame, then <=1024 bytes: 640x480 camera H.264 bare slice data
  *   pad -> server 'N' count 0 0, then count x {u32 frame, u16 packet (0xffff: all of it), u16 0}: send these again
- *   pad -> server 'I' flags(1 = send a keyframe; bits 1-3: frames waiting for the decoder), u16 clock ticks (~1 us)
+ *   pad -> server 'I' flags(1 = keyframe; bits 1-3 = decoder queue; bit 7 = camera capable), u16 clock ticks (~1 us)
  *                since the screen's last refresh, u8 backlight (1..6, 0 = off), 0 0 0, the 128-byte input report
  * Video is each frame's raw CABAC slice data, put together here from its packets and handed whole to the hardware
  * decoder (libwup's wup_video_*: the kernel's driver). While video plays the screen's memory is the decoder's: the
@@ -184,6 +186,10 @@ static u32 peer_on, last_ms, quiet_until, beacon_ms, in_ms, stat_ms;
 static u16 in_seq;
 static void send_to(const struct sockaddr_in *to, const void *d, u32 n) { sendto(sock, d, n, 0, (const struct sockaddr *)to, sizeof *to); }
 static void send_peer(const void *d, u32 n) { if (peer_on) send_to(&peer_sa, d, n); }
+static int send_peer_ok(const void *d, u32 n) {
+    return peer_on && sendto(sock, d, n, MSG_DONTWAIT,
+        (const struct sockaddr *)&peer_sa, sizeof peer_sa) == (int)n ? 0 : -1;
+}
 
 /* ---- video: whole frames to the hardware decoder (wup_video_frame: the kernel's driver owns the engine, the
    bitstream ring and the screen's video layer). Every keyframe restarts it; after a lost or late frame only a
@@ -330,15 +336,74 @@ static void motor(int on, u32 now) {
     if (on) { if (!motor_on) wup_rumble(1); motor_on = 1; motor_ms = now; } else if (motor_on) { wup_rumble(0); motor_on = 0; }
 }
 /* ---- the microphone */
-static u32 mic_on, mic_seq;
-static void mic(int on) { if (on == (int)mic_on) return; if (on) wup_mic_open(); else wup_mic_close(); mic_on = (u32)on; }
-static void mic_poll(void) {
+static u32 mic_on, mic_seq, mic_have, mic_first_ms;
+static void mic(int on) {
+    if (on == (int)mic_on) return;
+    if (on) wup_mic_open();
+    else { wup_mic_close(); mic_have = 0; }
+    mic_on = (u32)on;
+}
+static void mic_poll(u32 now) {
     static u8 m[8 + 1024] __attribute__((aligned(4))) = { 'M' };
+    while (mic_have < 512) {
+        int n = wup_mic_read((int16_t *)(m + 8) + mic_have, (int)(512 - mic_have));
+        if (n <= 0) break;
+        if (!mic_have) mic_first_ms = now;
+        mic_have += (u32)n;
+    }
+    if (mic_have == 512 || (mic_have && now - mic_first_ms >= 15)) {
+        memcpy(m + 4, &mic_seq, 4); mic_seq += mic_have;
+        send_peer(m, 8 + 2 * mic_have);
+        mic_have = 0;
+    }
+}
+
+/* ---- camera: one V2 hardware encoder shared by every server-side consumer.
+   The radio queue retains six free entries for input and video NACK traffic.
+   A newer frame is discarded while the previous one is still being sent;
+   the server requests a clean encoder run with 'K' after any resulting gap. */
+#define CAMF 0x10000u
+static u8 *cam_f, *cam_new;
+static u32 cam_on, cam_want, cam_len, cam_pos, cam_no, cam_retry_ms;
+static u32 cam_sent, cam_drop, cam_idx, cam_asked, cam_busy, cam_restarts;
+static u8 cam_run, cam_seen;
+static void camera_set(int on, u32 now) {
+    cam_want = (u32)on;
+    if (on == (int)cam_on || (on && !von)) return;
+    if (on) {
+        if (wup_camera_encode_open()) { cam_retry_ms = now + 1000; return; }
+        cam_len = cam_pos = 0; cam_seen = 0xff;
+    } else {
+        wup_camera_encode_close();
+    }
+    cam_on = (u32)on;
+}
+static void camera_pause(void) {
+    if (cam_on) wup_camera_encode_close();
+    cam_on = 0; cam_len = cam_pos = 0;
+}
+static void camera_poll(u32 now) {
     for (;;) {
-        int n = wup_mic_read((int16_t *)(m + 8), 512);
-        if (n <= 0) return;
-        memcpy(m + 4, &mic_seq, 4); mic_seq += (u32)n;
-        send_peer(m, 8 + 2 * (u32)n);
+        int n = wup_camera_encode_read(cam_len ? cam_new : cam_f, CAMF);
+        if (n < 0) { camera_pause(); cam_retry_ms = now + 1000; return; }
+        if (!n) break;
+        u8 run = (u8)wup_camera_encode_starts();
+        if (run != cam_seen) { cam_seen = run; cam_idx = 0; }
+        if (cam_len) cam_drop++;
+        else { cam_len = (u32)n; cam_pos = 0; cam_no = cam_idx; cam_run = run; }
+        cam_idx++;
+    }
+    for (int parts = 0; cam_len && parts < 4 && wup_net_tx_room() > 6; parts++) {
+        static u8 message[8 + 1024] __attribute__((aligned(4))) = { 'C' };
+        u32 bytes = cam_len - cam_pos < 1024 ? cam_len - cam_pos : 1024;
+        message[1] = cam_run;
+        message[2] = (u8)(cam_pos / 1024);
+        message[3] = (u8)((cam_len + 1023) / 1024);
+        memcpy(message + 4, &cam_no, 4);
+        memcpy(message + 8, cam_f + cam_pos, bytes);
+        if (send_peer_ok(message, 8 + bytes)) { cam_busy++; break; }
+        cam_pos += bytes;
+        if (cam_pos == cam_len) { cam_len = 0; cam_sent++; }
     }
 }
 /* ---- the backlight: the server's level while it streams (1..6: the pad's own table, as wupstream counts them; libwup
@@ -614,6 +679,9 @@ static void draw_ingame(void) {
         else
             snprintf(mline, sizeof mline, "Mode: %s", mname);
         gfx_text_c(&font_small, GFX_W / 2, 148, mline, RGB(140, 190, 235));
+        gfx_text_c(&font_small, GFX_W / 2, 164,
+                   cam_want ? "Camera: requested (paused in this menu)" : "Camera: off",
+                   cam_want ? RGB(120, 210, 170) : RGB(120, 135, 170));
         mi_n = 0;
         for (int i = 0; i < 5; i++)
             menu_item(mi_n++, 176 + i * 46, 38, ingame_labels[i], menu_sel == i);
@@ -1269,6 +1337,7 @@ static void delconf_activate(int sel) {
 
 static void end_session(void) {
     diag_event(40, frames, von);
+    camera_set(0, 0);                                   /* encoder shares video memory: stop it first */
     wup_video_close();                                   /* (the decoder and its screen layer off; safe when idle) */
     motor(0, 0); mic(0);
     light_now = 0;
@@ -1298,7 +1367,10 @@ static void packet(const u8 *d, u32 len, const struct sockaddr_in *from, u32 now
         /* WUP ThinClient: only the configured server may start a session.
            The explicit IP is a selection filter, not authentication. */
         if (!ip_matches(from)) return;
-        peer_sa = *from; peer_on = 1; need_idr = 1; frames = keys = lost = resent = stalls = full = gap_max = qmax = 0; stat_ms = t_start = now;
+        peer_sa = *from; peer_on = 1; need_idr = 1;
+        frames = keys = lost = resent = stalls = full = gap_max = qmax = 0;
+        cam_sent = cam_drop = cam_busy = cam_restarts = cam_retry_ms = 0;
+        stat_ms = t_start = now;
         hk_reset(&hk);
         last_peer_ip = from->sin_addr.s_addr;
         state = ST_STREAMING;
@@ -1309,7 +1381,7 @@ static void packet(const u8 *d, u32 len, const struct sockaddr_in *from, u32 now
     if (!peer_on || from->sin_addr.s_addr != peer_sa.sin_addr.s_addr || from->sin_port != peer_sa.sin_port) return;
     last_ms = now;
     if (h[0] == 'H') {
-        mic(h[2] & 1); light(h[3]);
+        mic(h[2] & 1); camera_set(h[2] >> 1 & 1, now); light(h[3]);
         /* 5th hello byte (new servers): the effective input mode */
         if (len >= 5 && h[4] <= 1) remote_mode = h[4];
     }
@@ -1333,6 +1405,10 @@ static void packet(const u8 *d, u32 len, const struct sockaddr_in *from, u32 now
     if (h[0] == 'V' && n == 16 && state != ST_INGAME) video(d + 16, len, h, now);
     else if (h[0] == 'A' && len > 8) audio(d + 8, len);
     else if (h[0] == 'R') motor(h[1] & 1, now);
+    else if (h[0] == 'K' && cam_on && now - cam_asked > 200) {
+        wup_camera_encode_restart();
+        cam_asked = now; cam_len = 0; cam_restarts++;
+    }
     else if (h[0] == 'Q') {
         /* the server ended the session: reconnect when auto-connect is on */
         if (auto_connect) {
@@ -1384,14 +1460,22 @@ static void tick(u32 now) {                               /* every 1-2 ms */
     }
     watchdog(now);
     if (motor_on && now - motor_ms > 100) motor(0, now);
-    if (mic_on) mic_poll();
+    if (mic_on) mic_poll(now);
+    if (cam_want && !cam_on && von && (int)(now - cam_retry_ms) >= 0)
+        camera_set(1, now);
+    if (cam_on) camera_poll(now);
     if (now - stat_ms >= 5000) {                             /* every 5 s: what the stream did (tools/padlog.py) */
-        static const char *const name[] = { "frames ", " keyframes ", " lost ", " resent ", " stalls ", " full ", " gap-ms ", " queue " };
-        u32 v[] = { frames, keys, lost, resent, stalls, full, gap_max, qmax };
-        char l[200], *e = l;
-        for (int i = 0; i < 8; i++) {
+        static const char *const name[] = {
+            "frames ", " keyframes ", " lost ", " resent ", " stalls ",
+            " full ", " gap-ms ", " queue ", " camera ",
+            " camera-dropped ", " camera-busy ", " camera-restarts "
+        };
+        u32 values[] = { frames, keys, lost, resent, stalls, full, gap_max,
+            qmax, cam_sent, cam_drop, cam_busy, cam_restarts };
+        char l[300], *e = l;
+        for (int i = 0; i < 12; i++) {
             for (const char *q = name[i]; *q; q++) *e++ = *q;
-            char t[12]; int k = 0; u32 x = v[i];
+            char t[12]; int k = 0; u32 x = values[i];
             do t[k++] = (char)('0' + x % 10); while (x /= 10);
             while (k) *e++ = t[--k];
         }
@@ -1400,7 +1484,7 @@ static void tick(u32 now) {                               /* every 1-2 ms */
     const volatile u8 *report = wup_input_report();
     u16 seq = (u16)(report[0] | report[1] << 8);
     if (seq != in_seq || now - in_ms > 50) {
-        u8 m[8 + 128] = { 'I', (u8)(need_idr | (von ? waiting() << 1 : 0)) };
+        u8 m[8 + 128] = { 'I', (u8)(0x80 | need_idr | (von ? waiting() << 1 : 0)) };
         u32 since = wup_us_since_vblank();                   /* since the screen's last refresh (the server times frames to it) */
         m[2] = (u8)since; m[3] = (u8)(since >> 8); m[4] = (u8)(light_off ? 0 : level_now());
         const volatile u8 *rep = report;
@@ -1438,6 +1522,7 @@ static int menu_hit(int x, int y) {
 static void enter_ingame(void) {
     state = ST_INGAME; menu_sel = 0; ingame_sub = 0;
     int was = shown;
+    camera_pause();                                      /* keep cam_want; resume after the next decoded frame */
     wup_video_close();                                   /* decoder and video layer off (safe when idle) */
     von = 0; need_idr = 1; sync = 0;                     /* decoder idle; resync on resume */
     shown = 0;
@@ -1469,6 +1554,7 @@ static void ingame_activate(int sel) {
 int main(void) {
     last_clk = CLOCK;
     for (int i = 0; i < NASM; i++) if (!(as[i].data = malloc(FRAME_MAX))) return 1;   /* (frames put together: ~700 KB) */
+    if (!(cam_f = malloc(CAMF)) || !(cam_new = malloc(CAMF))) return 1;
     cfg_load();
     net_ok = wup_net_init() == 0;
     if (net_ok) {
