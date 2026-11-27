@@ -3,6 +3,9 @@
 | Feature | Status |
 |---|---|
 | GamePad homebrew (adapted pad client) | Implemented |
+| WUP Homebrew V2.1 + WOZT NetFS SDK migration (`3da1bfa5b3b2`) | Implemented + build-tested |
+| V2 kernel video/input/timing APIs | Implemented + build-tested; physical V2 regression pending |
+| GamePad camera H.264 uplink | Audited; implementation in progress |
 | Connection profile manager (≤8 named profiles, stable ids, v2 cfg, legacy migration) | Implemented + host unit tests — pending hardware validation |
 | Touchscreen alphanumeric QWERTY keyboard (name/host) + numeric pad (IPv4/port) | Implemented — pending hardware validation |
 | Profile editor validation, endpoint preview, delete confirmation | Implemented — pending hardware validation |
@@ -25,8 +28,6 @@
 | Profile manager / keyboards / direct connect on hardware | Pending physical retest |
 | 60 fps sustained | Not measured |
 
-Last updated: connection profile manager milestone (versioned profiles,
-alphanumeric keyboard, DNS re-resolution on reconnect, corrected
-auto-connect error path). Pending: physical retest, isolated-NAT
-direct-connection validation, secure WAN transport feasibility, PC
-reference client.
+Last updated: 2026-11-27 V2 compatibility audit. Pending: camera uplink,
+physical V2/profile/HOME regression retest, secure WAN transport feasibility,
+and the PC reference client.

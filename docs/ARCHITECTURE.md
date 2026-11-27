@@ -21,12 +21,13 @@ local connection UI. The desktop, browsers and files live on the server.
 
 ## App structure (`pad/main.c`, ~600 lines, C)
 
-Derived from `wup-stream/pad/main.c` @ `e1b0430`. Unchanged core:
+Derived from WUP Stream's pad client and migrated to WUP Homebrew V2.
+Unchanged core:
 
 - UDP socket :50000, broadcast `B` beacons to :50002 (WUP Stream uses :50001).
 - `H`/`V`/`A`/`R`/`Q` packet handling; `I`/`N`/`M` transmit.
-- Hardware decoder ring management (`VDEC`/`ENG` MMIO), frame reassembly
-  (`as[NASM]`), NACK (`nack`), watchdog keyframe recovery.
+- V2 kernel-owned hardware decode through `wup_video_*`, bounded whole-frame
+  reassembly (`as[NASM]`), NACK (`nack`), and watchdog keyframe recovery.
 - PCM audio queue (`wup_audio_*`), mic (`wup_mic_*`), rumble, backlight,
   flight-recorder diagnostics (`diag_*`).
 
@@ -57,11 +58,11 @@ Added for ThinClient:
 
 ## Memory budget
 
-GamePad: ARM926EJ-S, **4 MiB RAM total**. The app is a "large" libwup app:
-code in WUP_SPARE, `.bss` 258 KB at 0x190000, decoder frames are the display
-framebuffer itself (no copies). Build report: `code 151 KB, .bss 258 KB,
-322 KB left below the screen`. No dynamic allocation in the hot path; all
-packet/frame buffers are static.
+GamePad: ARM926EJ-S, **4 MiB RAM total**. The V2 build uses the kernel-owned
+decoder and four bounded frame-reassembly buffers. At the audited baseline,
+the app image is 270 KiB, `.bss` ends at `0x117c10`, the heap is 1260 KiB,
+and the packaged artifact is 142892 bytes. There is no per-frame allocation
+in the hot path.
 
 ## Input mapping (what the pad sends)
 

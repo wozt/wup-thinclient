@@ -19,7 +19,7 @@ make help      # list targets
 
 | Dependency | How it is obtained | Pinned to |
 |---|---|---|
-| libwup SDK (`wup-homebrew` repo, `libwup/` subdir) | git submodule `third_party/wup-homebrew` (auto-init by `make setup`) | `7b641902f9ea134e2d2a585be3ca3f60442ba174` (wozt/wup-homebrew `feature/netfs`) |
+| libwup SDK (`wup-homebrew` repo, `libwup/` subdir) | git submodule `third_party/wup-homebrew` (auto-init by `make setup`) | `3da1bfa5b3b2d3a46d31a0fceeef3b2c1256ef15` (wozt/wup-homebrew `feature/netfs-v2`, based on V2.1.0) |
 | LLVM (clang, ld.lld, llvm-ar/nm/objcopy, >= 19) | system install; auto-detected by `scripts/setup.sh` (`$LLVM_BIN` override) | toolchain, not vendored |
 | littlefs, lwIP, tinf, heatshrink, picolibc, compiler-rt | fetched by the SDK's own `tools/deps.py`/`tools/sdk.py` into `libwup/third_party` and `libwup/build` (git-ignored there) | upstream tags/commits in `tools/deps.py` |
 
@@ -47,5 +47,6 @@ containing `tools/wupbuild.py`).
 
 ## Artifact
 
-`build/apps/wup_thinclient.wup` (~111 KB). `build/` is git-ignored;
+`build/apps/wup_thinclient.wup` (142892 bytes at the audited V2 baseline).
+`build/` is git-ignored;
 release ZIPs/checksums are produced by CI later.

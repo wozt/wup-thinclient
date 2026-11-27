@@ -2,11 +2,11 @@
 
 | Upstream | Pinned revision | Role |
 |---|---|---|
-| github.com/wozt/wup-stream (`pad/` client) | `e1b04305ca123e3f6980d60ef302ada9c19ce127` | source of `pad/main.c`, protocol, decoder logic |
-| github.com/wozt/wup-homebrew (`libwup/`) | `7b641902f9ea134e2d2a585be3ca3f60442ba174` (`feature/netfs`) | build SDK — **git submodule** `third_party/wup-homebrew` |
-| github.com/ravensclawx/wup-homebrew | `main` = `8e717434db04ea713b25ac627e12ab813639bf59` | upstream of the SDK fork |
+| github.com/wozt/wup-stream (`pad/` client) | `6ac48c732c9d9adc170719abef2696f9ea108d08` (camera baseline `a082db95ba62`) | current protocol/V2/camera reference; ThinClient remains an adapted independent client |
+| github.com/wozt/wup-homebrew (`libwup/`) | `3da1bfa5b3b2d3a46d31a0fceeef3b2c1256ef15` (`feature/netfs-v2`) | build SDK — **git submodule** `third_party/wup-homebrew` |
+| github.com/ravensclawx/wup-homebrew | V2.1.0 `b4f7ff70734c1503fae333f3e0c01af4147f6dfb` | upstream V2 base merged into the SDK fork |
 
-The submodule points at wozt's `feature/netfs` tip because that is the SDK
+The submodule points at wozt's `feature/netfs-v2` tip because that is the SDK
 the developer's Homebrew Menu/toolchain actually uses; it is fully pushed
 to GitHub, so a fresh `git clone --recurse-submodules` reproduces the
 environment. An uncommitted local SDK can be substituted via
@@ -14,9 +14,11 @@ environment. An uncommitted local SDK can be substituted via
 
 ## Adapted files
 
-- `pad/main.c` — adapted from `wup-stream/pad/main.c` @ `e1b0430`
-  (~470 → ~610 lines). Unchanged core: UDP/`B` beacon, `H`/`V`/`A`/`R`/`Q`,
-  `I`/`N`/`M`, HW H.264 decode, PCM audio, NACK, watchdog, diag thread.
+- `pad/main.c` — originally adapted from `wup-stream/pad/main.c`; subsequently
+  migrated to the V2 kernel video/input/timing APIs while retaining the WUP
+  Stream wire format. Unchanged core: UDP/`B` beacon,
+  `H`/`V`/`A`/`R`/`Q`, `I`/`N`/`M`, hardware H.264 decode, PCM audio, NACK,
+  watchdog, and diagnostic thread.
   Local additions: `pad/profiles.c` + `cfg_load`/`cfg_save`
   (`/save/thinclient.cfg`, versioned profiles with legacy migration),
   `ip_matches`, local connection UI (profile list, profile editor,
@@ -33,5 +35,7 @@ for protocol reference only.
 ## Compatibility requirements
 
 - Firmware **7677** only.
+- WUP Homebrew **V2** kernel/menu. V1 and V2 `.wup` binaries are ABI
+  incompatible; a current ThinClient must be rebuilt from this repository.
 - H.264 baseline/CABAC slices at 854×480 — produced by WUP Stream servers /
   WUP ThinServer; other encoders are not guaranteed decoder-compatible.
